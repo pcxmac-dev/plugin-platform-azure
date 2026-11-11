@@ -31,7 +31,11 @@ def test_the_card_is_sound_and_names_each_api_it_attaches_to():
     assert "still" in arm.costs and "deallocated" in arm.costs  # a powered-off VM still bills: said
     assert len(arm.areas) > 3 * len(arm.covered)  # the rest of the API shown as such
     billable = {c.name for a in APIS for c in a.calls if c.costs}
-    assert all(not c.used for a in APIS for c in a.calls if c.costs) and len(billable) >= 6
+    assert len(billable) >= 7
+    # the one costing call it makes: a VM's start (a deallocated VM's compute charge starts again; its form says so)
+    assert {c.name for a in APIS for c in a.used if c.costs} == {f"POST {api_mod.VM_START}"}
+    start = next(c for c in arm.calls if c.name == f"POST {api_mod.VM_START}")
+    assert "starts the compute charge again for a deallocated VM" in start.about
 
 
 def test_the_calls_it_names_as_used_are_the_ones_the_client_makes():

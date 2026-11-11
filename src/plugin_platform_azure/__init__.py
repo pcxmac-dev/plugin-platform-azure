@@ -388,7 +388,7 @@ class AzurePlugin(MachinePlugin):
             self._rt.soon = time.monotonic() + SOON_S
         self._rt.wake.set()
         lines = {
-            "start": "its compute is billed again from when it runs",
+            "start": page.start_words(v["power"]),
             "restart": "it stays allocated and billed",
             "deallocate": "its compute is no longer billed once it is deallocated (its disks and static IPs still are)",
             "poweroff": "it is still billed for its compute while powered off: deallocate it to stop that",

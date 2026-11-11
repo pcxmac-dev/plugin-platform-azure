@@ -19,8 +19,10 @@ documentation"):
   DNS for the zones and their record sets; the Retail Prices API for each VM size's price an hour (Linux or Windows,
   regular or spot, kept a day); a list followed across its pages on Resource Manager's own host alone; a part that
   cannot be read said under its table, the rest shown;
-- the free changes, each through a form the platform's page confirms: a VM started, restarted, deallocated or powered
-  off (power off still bills: said, and asked a second time, `accept_still_billed`); a DNS record set and removed, the
+- the free changes, each through a form the platform's page confirms: a VM started (its confirmation says which applies
+  to that VM: a deallocated one's compute charge starts again, a stopped one was billing all along; the start call marked
+  as costing on the card), restarted, deallocated or powered off (power off still bills: said, and asked a second time,
+  `accept_still_billed`); a DNS record set and removed, the
   record set read just before and written whole with its etag, every other record kept, the zone's own SOA and NS, alias
   record sets and a CNAME beside other records refused; a security rule added or removed (one opening SSH, RDP or every
   port to the whole internet, denying SSH or RDP to a VM, or removing the rule that lets SSH in to one, asked twice,

@@ -43,6 +43,22 @@ def day(stamp: str) -> str:
     return str(stamp or "")[:10] or "–"
 
 
+DEALLOCATED = ("deallocated", "hibernated")  # its compute not billed: a Start bills it again
+
+
+def start_form(power: str) -> str:
+    """The Start form for a VM in this power state (as read): a deallocated VM's Start starts its compute charge again; a
+    stopped (powered-off, still allocated) VM was billing all along."""
+    return "vm:start-deallocated" if power in DEALLOCATED else "vm:start-stopped"
+
+
+def start_words(power: str) -> str:
+    """What starting a VM in this power state does to the bill, in words."""
+    if power in DEALLOCATED:
+        return "it was deallocated: starting it starts its compute charge again, by the hour"
+    return "it was stopped but still allocated: it has been billed for its compute all along, so the bill does not change"
+
+
 def price_cells(price: dict | None, why: str = "") -> object:
     if not price:
         return cell("–", why or None)
@@ -63,7 +79,8 @@ def vm_table(snap: Snapshot, prices: dict, writable: bool) -> dict:
                price_cells(price, why), ", ".join(v["ipv4"]) or "–", ", ".join(v["ipv6"]) or "–", day(v["created"])]
         if writable:
             for action, (title, states) in ACTIONS.items():
-                row.append({"form": f"vm:{action}", "title": title, "label": f"{title} {v['name']}",
+                form = start_form(v["power"]) if action == "start" else f"vm:{action}"
+                row.append({"form": form, "title": title, "label": f"{title} {v['name']}",
                             "values": {"group": v["group"], "name": v["name"], "action": action}}
                            if v["power"] in states else "")
         rows.append(row)
@@ -218,15 +235,19 @@ def others_table(snap: Snapshot) -> dict:
 
 # -- the forms --------------------------------------------------------------------------------------------------------------
 def vm_forms() -> list:
-    """The four power changes, each a form over the hook `power` (group, name, action, accept_still_billed), its
-    confirmation saying what it bills."""
+    """The power changes, each a form over the hook `power` (group, name, action, accept_still_billed), its confirmation
+    saying what it bills: two Start forms, the row's button naming the one for its VM's power state as read (a deallocated
+    VM's compute charge starts again; a stopped one was billing all along), each asked once."""
     fixed = [{"name": "group", "label": "Resource group", "type": "fixed"}, {"name": "name", "label": "VM", "type": "fixed"}]
     accept = {"name": ACCEPT_BILLED, "type": "accept", "title": "Power it off anyway?", "yes": "Power off anyway",
               "words": ("Powered off, {name} keeps its place on its host and is billed for its compute by the hour, as when "
                         "it runs. Deallocate is what stops that charge.")}
     words = {
-        "start": ("Start this VM?", "{name} in {group} is started: from then on its compute is billed by the hour again "
-                  "(its price is in the table). A dynamic public IP may come back as another address.", "Start it", False),
+        "start-deallocated": ("Start this VM?", "{name} in {group} is deallocated, so its compute is not billed now. "
+                              "Starting it STARTS ITS COMPUTE CHARGE AGAIN, by the hour (its price is in the table), and a "
+                              "dynamic public IP may come back as another address.", "Start it", False),
+        "start-stopped": ("Start this VM?", "{name} in {group} is stopped (powered off) but still allocated: it has been "
+                          "billed for its compute all along, so starting it adds no charge.", "Start it", False),
         "restart": ("Restart this VM?", "{name} in {group} is restarted: its operating system restarts, and what is not "
                     "saved is lost. It stays allocated and billed.", "Restart it", True),
         "deallocate": ("Deallocate this VM?", "{name} in {group} is shut down and its compute released: its compute is no "
@@ -237,10 +258,10 @@ def vm_forms() -> list:
                      "asked once more.", "Power it off", True),
     }
     out = []
-    for action, (title, _) in ACTIONS.items():
-        head, text, yes, danger = words[action]
+    for form, (head, text, yes, danger) in words.items():
+        action = form.split("-", 1)[0]
         fields = [*fixed, {"name": "action", "label": "Change", "type": "fixed", "value": action}, accept]
-        out.append({"id": f"vm:{action}", "hook": "power", "title": f"{title} a VM", "fields": fields,
+        out.append({"id": f"vm:{form}", "hook": "power", "title": f"{ACTIONS[action][0]} a VM", "fields": fields,
                     "confirm": {"title": head, "words": text, "yes": yes, "danger": danger}})
     return out
 

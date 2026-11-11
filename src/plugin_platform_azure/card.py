@@ -52,8 +52,9 @@ ARM = Api(
             "listing VMs 900 at most (300 a minute) a subscription; a VM's start, restart, power off or deallocation 12 "
             "at most (4 a minute) a VM. Network: 10,000 reads and 1,000 writes in 5 minutes."),
     costs=("Asking costs nothing. A running VM bills its compute by the hour, and so does a stopped (powered-off) one; "
-           "a deallocated one does not, though its disks and networking still bill. Creating VMs, disks, snapshots or "
-           "public IPs, resizing and backups start or raise charges: the plugin does none of them."),
+           "a deallocated one does not, though its disks and networking still bill, and starting it starts its compute "
+           "charge again (the plugin's Start says so first). Creating VMs, disks, snapshots or public IPs, resizing and "
+           "backups start or raise charges: the plugin does none of them."),
     links=(
         Link("Azure REST API reference", f"{REST}/azure/", "docs"),
         Link("Resource Manager REST API", f"{REST}/resources/", "reference"),
@@ -158,7 +159,10 @@ ARM = Api(
              "Virtual machines", "the Virtual machines table and their power states", f"{COMPUTE}/virtual-machines/list-all"),
         call("GET", VM_VIEW, "Virtual Machines - Instance View: a VM's run-time state", "Virtual machines",
              "a power state the list did not give", f"{COMPUTE}/virtual-machines/instance-view"),
-        call("POST", VM_START, "Virtual Machines - Start", "Virtual machines", "Start…", f"{COMPUTE}/virtual-machines/start", writes=True),
+        call("POST", VM_START, "Virtual Machines - Start: starts the compute charge again for a deallocated VM (a stopped "
+             "one was billing all along)", "Virtual machines",
+             "Start… (its confirmation says which applies to that VM, from its power state as read)",
+             f"{COMPUTE}/virtual-machines/start", writes=True, costs=True),
         call("POST", VM_RESTART, "Virtual Machines - Restart", "Virtual machines", "Restart…", f"{COMPUTE}/virtual-machines/restart",
              writes=True),
         call("POST", VM_DEALLOCATE, "Virtual Machines - Deallocate: shut down, its compute released and no longer billed",

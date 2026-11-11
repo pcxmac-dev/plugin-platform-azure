@@ -157,7 +157,7 @@ def main(argv: list[str] | None = None, plugin=None, out=None, err=None, ask=Non
                                                     f"in {len(found)} resource groups: name one with --group"))
                 return 1
             v = found[0]
-            words = {"start": f"{v['name']} is started: its compute is billed again from then on.",
+            words = {"start": f"{v['name']} is started: {page.start_words(v['power'])}.",
                      "restart": f"{v['name']} is restarted: what is not saved is lost; it stays billed.",
                      "deallocate": f"{v['name']} is deallocated: its compute is no longer billed (its disks still are).",
                      "poweroff": f"{v['name']} is powered off: it is STILL BILLED for its compute, as if it ran."}[action]

@@ -34,7 +34,7 @@ Only what costs nothing, each through a form on the platform's page that names t
 
 | Change | Asked | What it does to the bill |
 |---|---|---|
-| **Start** a VM | once | its compute is billed again from then on |
+| **Start** a VM | once | a deallocated VM's compute charge starts again; a stopped (powered-off) one was billing all along (its confirmation says which, from its state as read) |
 | **Restart** a VM | once | none: it stays allocated and billed |
 | **Deallocate** a VM | once | its compute is no longer billed (a dynamic public IP is released; the temporary disk's data may be lost) |
 | **Power off** a VM | **twice** | none: it is still billed, as if it ran (said, and asked again) |

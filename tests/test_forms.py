@@ -55,7 +55,8 @@ def read(made, env):
 def test_every_form_is_its_hooks_arguments_in_order_and_confirmed(read):
     p, fake = read
     forms = forms_of(p)
-    assert set(forms) == {"vm:start", "vm:restart", "vm:deallocate", "vm:poweroff", "rule-add:web-rg/subnet-nsg",
+    assert set(forms) == {"vm:start-deallocated", "vm:start-stopped", "vm:restart", "vm:deallocate", "vm:poweroff",
+                          "rule-add:web-rg/subnet-nsg",
                           "rule-remove:web-rg/subnet-nsg", "rule-add:web-rg/web1-nsg", "rule-remove:web-rg/web1-nsg",
                           "record-set:dns-rg/example.com", "record-remove:dns-rg/example.com", "key-add", "key-remove"}
     hooks = p.interface()["hooks"]
@@ -65,7 +66,9 @@ def test_every_form_is_its_hooks_arguments_in_order_and_confirmed(read):
         assert all(x["type"] in ("text", "number", "choice", "fixed", "accept") for x in f["fields"])
         assert f["confirm"]["words"] and f["confirm"]["yes"]
     assert "STILL BILLED" in forms["vm:poweroff"]["confirm"]["words"] and "asked once more" in forms["vm:poweroff"]["confirm"]["words"]
-    assert "no longer billed" in forms["vm:deallocate"]["confirm"]["words"] and "billed by the hour again" in forms["vm:start"]["confirm"]["words"]
+    assert "no longer billed" in forms["vm:deallocate"]["confirm"]["words"]
+    assert "STARTS ITS COMPUTE CHARGE AGAIN" in forms["vm:start-deallocated"]["confirm"]["words"]
+    assert "billed for its compute all along" in forms["vm:start-stopped"]["confirm"]["words"]
     assert forms["record-remove:dns-rg/example.com"]["confirm"]["danger"] is True
     assert [c["value"] for c in next(x for x in forms["record-set:dns-rg/example.com"]["fields"] if x["name"] == "rtype")["choices"]] == \
         ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SRV", "CAA", "PTR"]
@@ -86,6 +89,25 @@ def test_the_power_forms_send_the_vm_actions_as_the_reference_gives_them(read):
         r = last(fake, "POST")
         assert r["path"] == f"{ARM}/resourceGroups/web-rg/providers/Microsoft.Compute/virtualMachines/{button.split()[1]}/{path}"
         assert r["query"] == {"api-version": "2026-04-01"} and r["body"] is None
+
+
+def test_start_says_which_applies_to_that_vm_from_its_power_state(read):
+    """A deallocated VM's Start starts its compute charge again; a stopped (powered-off) VM was billing all along: the row's
+    Start opens the form that says which, from the state as read, and is asked once."""
+    p, fake = read
+    b = row_button(p, "Virtual machines", "Start win1")  # win1 deallocated
+    f = forms_of(p)[b["form"]]
+    assert b["form"] == "vm:start-deallocated" and "STARTS ITS COMPUTE CHARGE AGAIN" in f["confirm"]["words"]
+    rep = p.ask(f["hook"], *page_args(f, b["values"]))  # asked once: no second confirmation
+    assert rep["ok"] and "starts its compute charge again" in rep["lines"][0]
+    fake.vms["web1"]["power"] = "stopped"  # powered off, still allocated
+    p.refresh()
+    b = row_button(p, "Virtual machines", "Start web1")
+    f = forms_of(p)[b["form"]]
+    assert b["form"] == "vm:start-stopped" and "billed for its compute all along" in f["confirm"]["words"]
+    assert "CHARGE AGAIN" not in f["confirm"]["words"]
+    rep = p.ask(f["hook"], *page_args(f, b["values"]))
+    assert rep["ok"] and "billed for its compute all along" in rep["lines"][0] and fake.vms["web1"]["power"] == "running"
 
 
 def test_power_off_still_bills_so_it_is_sent_only_once_that_is_accepted(read):
