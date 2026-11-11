@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plugin-platform-azure"
-version = "0.1.0"  # the plugin's own release (CHANGELOG.md); the platform shows it on the plugin's page
+version = "0.1.1"  # the plugin's own release (CHANGELOG.md); the platform shows it on the plugin's page
 description = "Microsoft Azure for Liminal's platform: a subscription's VMs with their power state and price, disks, public IPs, network security groups, Azure DNS and SSH keys through Azure Resource Manager; free changes only, each confirmed; Dynamic DNS through Azure DNS."
 readme = "README.md"
 requires-python = ">=3.10"
 # the library it plugs into (the machine kind: liminal_libs.machines, plugin API 2.2; RestClient, TokenSource and the
-# Dynamic DNS keeper: liminal_libs.machines.rest and .ddns; the Login interface: liminal_libs.apps)
-dependencies = ["liminal-libs>=1.49.0"]
+# Dynamic DNS keeper: liminal_libs.machines.rest and .ddns, 1.49.2's keeper changing only what is its own; the Login
+# interface: liminal_libs.apps)
+dependencies = ["liminal-libs>=1.49.2"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

@@ -3,50 +3,60 @@ only"): a subscription through Azure Resource Manager, as a service principal se
 groups, the VMs with their power state, size and price an hour (Azure's Retail Prices API), disks, public IP addresses,
 network security groups and their rules with the VMs they are attached to, Azure DNS zones and their records, SSH public
 keys, the cost this month so far and how many of every other kind of resource it holds. It changes only what costs
-nothing, each change confirmed on the platform's page first: a VM started, restarted or deallocated (which stops its
-compute's charge), or powered off (which does not: said so, and asked twice); DNS records set and removed (every other
-record kept); network security rules added and removed (a risky one asked twice); SSH public keys added and removed; and
-Dynamic DNS keeping hosts at this network's public IPv4 address through Azure DNS. Nothing that creates, resizes,
-restores or destroys a billable thing.
+nothing, each change confirmed on the platform's page first: a VM started (a deallocated one's compute charge starts
+again: asked twice, its state read just before), restarted or deallocated (which stops its compute's charge), or powered
+off (which does not: said so, and asked twice); DNS records set and removed (every other record kept); network security
+rules added and removed (never one replaced; a risky one asked twice); SSH public keys added and removed (never one
+replaced); and Dynamic DNS keeping hosts at this network's public IPv4 address through Azure DNS (the library's Keeper:
+only a record that is its own, or that the user let it take over). Nothing that creates, resizes, restores or destroys a
+billable thing.
 
 Its settings are pairs asked of the login of the app it is attached to (settings.py: AZURE_TENANT_ID, AZURE_CLIENT_ID,
-AZURE_CLIENT_SECRET, AZURE_SUBSCRIPTION_ID, AZURE_DDNS_HOSTS, AZURE_DDNS_MINUTES), never a file of its own. While attached to
-the platform app it reads the subscription every quarter of an hour and checks the Dynamic DNS hosts every few minutes in
-a thread of its own; detached, nothing of it runs. Its status is what was read last (no request is made to answer it).
+AZURE_CLIENT_SECRET, AZURE_SUBSCRIPTION_ID, AZURE_DDNS_HOSTS, AZURE_DDNS_MINUTES), never a file of its own. Attached to the
+platform app it reads the subscription every quarter of an hour and checks the Dynamic DNS hosts every few minutes in a
+thread of its own (attached by another app, the charts app run alone, nothing of it runs on its own); detached, nothing
+of it runs, and a pass under way writes nothing more. A read that failed for a passing reason (no connection, Azure busy)
+leaves it valid, says so, and is tried again within minutes. Its status is what was read last (no request is made to
+answer it).
 
     python -m plugin_platform_azure status | servers | groups | disks | ips | firewalls | domains | records ZONE | keys
         | cost | ddns [--now] | power NAME start|restart|deallocate|poweroff | set ZONE NAME TYPE VALUE | remove ZONE NAME TYPE VALUE
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
+from collections.abc import Mapping
+from pathlib import Path
 
 from liminal_libs.machines import ddns as dyndns
 from liminal_libs.machines.plugin import MachinePlugin
-from liminal_libs.machines.rest import RestError
+from liminal_libs.machines.rest import RestError, scrub
 
 from . import model
 from . import page
 from . import records as recs
 from . import rules as nsg_rules
 from . import settings as settings_mod
-from .api import AzureApi, pick_price, power_of, statuses_of
+from .api import HOURS_A_MONTH, AzureApi, pick_price, power_of, statuses_of
 from .card import APIS, ARM_NAME, DNS_NAME, IDENTITY_NAME, PRICES_NAME
-from .page import ACCEPT_BILLED, ACCEPT_RISKY, BILLING, plural, when
+from .page import ACCEPT_BILLED, ACCEPT_COSTS, ACCEPT_RISKY, BILLING, plural, when
 from .records import Refusal
 from .settings import CREDENTIALS, KEYS, NAMES, Config
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 REFRESH_S = 900.0  # the subscription read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
+RETRY_SOON_S = 60.0  # a read that failed for a passing reason tried again after this, then twice as long each time
 ZONES_MAX = 12  # the zones whose record sets a refresh reads (the rest: `records ZONE`)
 VIEWS_MAX = 10  # the VMs whose power state a refresh asks one by one when the list did not give it
 PRICES_MAX = 20  # the VM sizes a refresh asks the price of (the rest the next time)
 PRICE_KEEP_S = 86_400.0  # a size's price kept a day
 COST_S = 6 * 3600.0  # the cost this month asked at most this often (Cost Management throttles hard)
 SOON_S = 45.0  # after a power change, the VMs' states read again this soon (one request)
+DIR_VAR = "LIMINAL_PLATFORM_DIR"  # the platform's own folder (its app's variable): the Dynamic DNS state goes under it
 # the name servers asked for this network's public IPv4 address (dns.public_address): the plugin names them, as hw-stats does
 PUBLIC_IPV4 = (("myip.opendns.com", "a", "208.67.222.222", "OpenDNS"), ("o-o.myaddr.l.google.com", "txt", "216.239.32.10", "Google"))
 NOT_SET = ("not set up: AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET and AZURE_SUBSCRIPTION_ID, a service "
@@ -55,6 +65,46 @@ NOT_SET = ("not set up: AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET an
            "> Access control (IAM)) that reads everything (*/read) and makes only the free changes: the README's custom role "
            "(VMs started, restarted, deallocated and powered off; DNS record sets; security rules; SSH public keys)")
 POWER_ACTIONS = {"start": "start", "restart": "restart", "deallocate": "deallocate", "poweroff": "powerOff"}
+COSTLY_START = frozenset({"deallocated", "hibernated", "deallocating", ""})  # a start that starts the compute charge again
+# ("" : its state could not be read just before: taken as the costly one)
+
+
+def transient(e: BaseException) -> bool:
+    """A failure that passes (no connection, Azure busy or failing, a rate limit): the plugin stays valid and tries again
+    soon. A refusal (the credentials, a role, a subscription not found) is no passing trouble."""
+    return isinstance(e, RestError) and (e.status == 0 or e.status == 429 or e.status >= 500)
+
+
+def ddns_state_file() -> Path:
+    """Where the Dynamic DNS keeper keeps what is its own: the platform's folder's azure/ddns.json (LIMINAL_PLATFORM_DIR,
+    else the data folder's platform/)."""
+    named = (os.environ.get(DIR_VAR) or "").strip()
+    if named:
+        return Path(named).expanduser() / "azure" / "ddns.json"
+    from liminal_libs import layout
+
+    return layout.data_dir() / "platform" / "azure" / "ddns.json"
+
+
+def _fqdn(text: str) -> str:
+    """A Dynamic DNS host as set (home.example.com, @.example.com, example.com.) as the keeper names it."""
+    name = str(text or "").strip().rstrip(".").lower()
+    return name[2:] if name.startswith("@.") else name
+
+
+def accepted(value) -> bool:
+    """A second confirmation counts only when it is exactly true (the page sends JSON true): "false", "yes" or 1 from a
+    program on this PC is refused like none."""
+    return value is True
+
+
+class _Pass:
+    """A Dynamic DNS pass's own: the settings and the API it was begun with, the zones as read then, its stop event (the
+    plugin detached: nothing more is written), the record sets it read (written with their etags)."""
+
+    def __init__(self, cfg: Config, api: AzureApi, snap: model.Snapshot, stop: threading.Event | None):
+        self.cfg, self.api, self.snap, self.stop = cfg, api, snap, stop
+        self.seen: dict = {}
 
 
 class _Runtime:
@@ -69,15 +119,17 @@ class _Runtime:
         self.api_ok: bool | None = None  # the last refresh's outcome (None: none yet)
         self.api_error = ""
         self.api_error_at: float | None = None
+        self.api_transient = False  # the last failure a passing one: still valid, tried again soon
         self.api_print = ""  # the settings that outcome is of
-        self.prices: dict = {}  # (region, size) -> (asked at, the price or None, why none)
+        self.prices: dict = {}  # (region, size, os, spot) -> (asked at, the price or None, why none)
         self.cost: dict | None = None
         self.cost_at: float | None = None
         self.cost_error = ""
         self.keeper: dyndns.Keeper | None = None
         self.ddns_print = ""
         self.ddns_at: float | None = None
-        self.seen: dict = {}  # a Dynamic DNS host's record set as its pass read it (written with its etag)
+        self.ddns_had: set[str] = set()  # the Dynamic DNS hosts of the last pass: one no longer set is let go
+        self.passing = threading.local()  # the Dynamic DNS pass under way in this thread (_Pass)
         self.soon: float | None = None  # when the VMs' states are read again after a power change (monotonic)
         self.worker: threading.Thread | None = None
         self.stop: threading.Event | None = None
@@ -87,7 +139,7 @@ class _Runtime:
 
 class AzurePlugin(MachinePlugin):
     """Microsoft Azure: a subscription through Resource Manager, its free changes confirmed, and Dynamic DNS through Azure
-    DNS; reading in the background while attached."""
+    DNS; reading in the background while the platform has it attached."""
 
     name = "azure"
     title = "Microsoft Azure"
@@ -98,18 +150,19 @@ class AzurePlugin(MachinePlugin):
     order = 764
     ICON = "azure"  # Azure's mark (liminal-libs 1.49.0's icons.js)
     HOOKS = (*MachinePlugin.HOOKS, "refresh", "vms", "zones", "records", "nsgs", "ssh_keys", "power", "set_record",
-             "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key", "ddns_update")
+             "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key", "ddns_update", "ddns_take_over")
     keys = KEYS
     signup = "https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-service-principal-portal"
     limits = ("Azure Resource Manager: per region, 250 reads (refilled 25 a second), 200 writes and 200 deletes (10 a second) "
               "for each subscription and service principal; Azure DNS: per zone 200 changes and 60 lists a minute")
     apis = APIS
 
-    def __init__(self, transport=None, public=None, clock=None, sleep=None):
+    def __init__(self, transport=None, public=None, clock=None, sleep=None, state: Path | None = None):
         self._transport = transport  # RestClient's (method, url, headers, body, timeout): a test's; else HTTPS
         self._public = public  # () -> (address, whose): a test's; else dns.public_address over PUBLIC_IPV4
         self._clock = clock or time.time
         self._sleep = sleep or time.sleep
+        self._state = Path(state) if state is not None else None  # the Dynamic DNS state file (a test's); else ddns_state_file()
         self._rt = _Runtime()
 
     # -- the settings, the API, the keeper ----------------------------------------------------------------------------------
@@ -132,7 +185,10 @@ class AzurePlugin(MachinePlugin):
 
     def client(self) -> AzureApi:
         """The APIs with the settings as they are (ValueError when they are not set)."""
-        cfg = self.config()
+        return self._client_for(self.config())
+
+    def _client_for(self, cfg: Config) -> AzureApi:
+        """The APIs for these settings (no settings read: a pass or a refresh under way keeps the ones it began with)."""
         if not cfg.api_ready:
             raise ValueError("the API is not set up: " + ("; ".join([*cfg.incomplete, *cfg.problems]) or NOT_SET))
         with self._rt.lock:
@@ -148,12 +204,15 @@ class AzurePlugin(MachinePlugin):
         with self._rt.lock:
             if self._rt.keeper is None:
                 self._rt.keeper = dyndns.Keeper(read=self._ddns_read, write=self._ddns_write, servers=PUBLIC_IPV4,
-                                                public=self._public, clock=self._clock)
+                                                public=self._public, clock=self._clock,
+                                                state=self._state if self._state is not None else ddns_state_file())
             return self._rt.keeper
 
     def snapshot(self) -> model.Snapshot | None:
         """What was read last, while the credentials are the ones it was read with."""
-        cfg = self.config()
+        return self._snap_of(self.config())
+
+    def _snap_of(self, cfg: Config) -> model.Snapshot | None:
         with self._rt.lock:
             return self._rt.snap if self._rt.snap_print == cfg.api_print else None
 
@@ -187,7 +246,7 @@ class AzurePlugin(MachinePlugin):
         try:
             return read()
         except RestError as e:
-            if e.refused and e.status == 401:
+            if e.status == 401:
                 raise
             troubles[part] = str(e)
             return default
@@ -196,7 +255,7 @@ class AzurePlugin(MachinePlugin):
         now = self._clock()
         troubles: dict = {}
         try:
-            api = self.client()
+            api = self._client_for(cfg)
             sub = model.subscription_of(api.subscription_info())  # the one read that must work: the credentials' test
             groups = self._part(troubles, "groups", api.groups, [])
             resources = self._part(troubles, "resources", api.resources, [])
@@ -211,6 +270,7 @@ class AzurePlugin(MachinePlugin):
         except (RestError, ValueError) as e:
             with self._rt.lock:
                 self._rt.api_ok, self._rt.api_error, self._rt.api_error_at, self._rt.api_print = False, str(e), now, cfg.api_print
+                self._rt.api_transient = transient(e)
             raise
         nics = model.nics_of(nic_items)
         ips = model.public_ips_of(ip_items)
@@ -234,6 +294,7 @@ class AzurePlugin(MachinePlugin):
         with self._rt.lock:
             self._rt.snap, self._rt.snap_print = snap, cfg.api_print
             self._rt.api_ok, self._rt.api_error, self._rt.api_error_at, self._rt.api_print = True, "", None, cfg.api_print
+            self._rt.api_transient = False
         return {"vms": len(vms), "zones": len(snap.zones), "nsgs": len(snap.nsgs), "readAt": when(now),
                 "troubles": dict(troubles)}
 
@@ -370,25 +431,36 @@ class AzurePlugin(MachinePlugin):
         return found[0]
 
     # -- the free changes ---------------------------------------------------------------------------------------------------
-    def power(self, group: str, name: str, action: str, accept_still_billed=False) -> dict:
+    def power(self, group: str, name: str, action: str, accept_still_billed=False, accept_costs=False) -> dict:
         """A VM started, restarted, deallocated (its compute no longer billed) or powered off (still billed: refused until
-        that is accepted, accept_still_billed); Azure accepts it and does it after, and the VMs' states are read again
-        soon after."""
+        that is accepted, accept_still_billed). A start reads the VM's state just before: one that starts the compute
+        charge again (a deallocated VM, or one whose state could not be read) is refused until that is accepted
+        (accept_costs, its price said); a stopped one was billing all along. Each accept counts only when exactly true.
+        Azure accepts the change and does it after; the VMs' states are read again soon after."""
         act = str(action or "").strip().lower().replace(" ", "").replace("_", "").replace("-", "")
         if act not in POWER_ACTIONS:
             raise ValueError(f"{action!r} is none of {', '.join(POWER_ACTIONS)}")
         v = self._vm(group, name)
-        if act == "poweroff" and not accept_still_billed:
+        if act == "poweroff" and not accepted(accept_still_billed):
             raise Refusal(f"{v['name']} powered off stays allocated and is still billed for its compute by the hour, as "
                           "when it runs (deallocate stops that charge): it is powered off only once that is accepted "
                           f"({ACCEPT_BILLED})", accept=ACCEPT_BILLED)
         api = self.client()
+        state = v["power"]
+        if act == "start":
+            state, words = power_of(statuses_of(api.instance_view(v["group"], v["name"])))  # read just before
+            if state:
+                self._set_power(v, state, words)
+            if state in ("running", "starting"):
+                raise Refusal(f"{v['name']} is {state} now (read just now): there is nothing to start")
+            if state in COSTLY_START and not accepted(accept_costs):
+                raise Refusal(self._start_costs(v, state), accept=ACCEPT_COSTS)
         answer = api.vm_action(v["group"], v["name"], POWER_ACTIONS[act])
         with self._rt.lock:
             self._rt.soon = time.monotonic() + SOON_S
         self._rt.wake.set()
         lines = {
-            "start": page.start_words(v["power"]),
+            "start": page.start_words(state),
             "restart": "it stays allocated and billed",
             "deallocate": "its compute is no longer billed once it is deallocated (its disks and static IPs still are)",
             "poweroff": "it is still billed for its compute while powered off: deallocate it to stop that",
@@ -397,6 +469,21 @@ class AzurePlugin(MachinePlugin):
         return {"vm": v["name"], "group": v["group"], "action": act, "accepted": answer.status == 202, "ok": True,
                 "said": f"{v['name']} is being {verb}" if answer.status == 202 else f"{v['name']} {verb}",
                 "lines": [lines, "its state shows on the next read (in about a minute, or Refresh)"]}
+
+    def _start_costs(self, v: dict, state: str) -> str:
+        """What starting this VM costs, in words: which charge starts again, at what price (the refusal's words)."""
+        price, _ = self._price_for(v)
+        cost = (f", {page.money(price['hour'], price['currency'])} an hour (about "
+                f"{page.money(price['hour'] * HOURS_A_MONTH, price['currency'])} a month: Azure's retail price for "
+                f"{v['size']})") if price else f" (its size {v['size']}: its price is on Azure's pricing pages)"
+        now = (f"{v['name']} is {state} now (read just now)" if state else
+               f"{v['name']}'s power state could not be read just now, so it is taken as deallocated")
+        return (f"{now}: starting it STARTS ITS COMPUTE CHARGE AGAIN, by the hour{cost}, until it is deallocated again. "
+                f"It is started only once that is accepted ({ACCEPT_COSTS})")
+
+    def _set_power(self, v: dict, state: str, words: str) -> None:
+        with self._rt.lock:
+            v["power"], v["powerWords"] = state, words
 
     def _vm(self, group: str, name: str) -> dict:
         snap = self._held()
@@ -407,15 +494,22 @@ class AzurePlugin(MachinePlugin):
 
     def set_record(self, group: str, zone: str, name: str, rtype: str, value: str, ttl=None) -> dict:
         """A record set in `zone` (records.plan_set): every other record set kept, the record set read just before and
-        written only if it is still as read (its etag)."""
+        written only if it is still as read (its etag). A Dynamic DNS host's A record set here by hand is let go by
+        Dynamic DNS (left as set until the user takes it over again)."""
         z = self._zone(zone, group)
         api = self.client()
         t = recs.record_type(rtype)
         n = recs.relative_name(name, z["name"])
         held = api.record_set(z["group"], z["name"], t, n)
-        others = [x for x in self._types_at(api, z, n) if x != t]
+        others = [x for x in self._types_at(api, self.snapshot(), z, n) if x != t]
         plan = recs.plan_set(z["name"], z["group"], n, t, value, held, others, ttl=ttl)
-        return self._send(api, z, plan)
+        report = self._send(api, z, plan)
+        if plan.changed and t == "A":
+            fqdn = z["name"].lower() if n == "@" else f"{n}.{z['name']}".lower()
+            if fqdn in {h.fqdn for h in self.ddns_hosts(self.config())[0]}:
+                self.keeper().let_go(fqdn)
+                report["lines"].append(f"{fqdn} is a Dynamic DNS host: it is left as you set it until you take it over again")
+        return report
 
     def remove_record(self, group: str, zone: str, name: str, rtype: str, value: str = "") -> dict:
         """A record removed from its record set (`value` names it); the last one deletes the record set."""
@@ -425,11 +519,16 @@ class AzurePlugin(MachinePlugin):
         n = recs.relative_name(name, z["name"])
         held = api.record_set(z["group"], z["name"], t, n) if t in recs.TYPES else None
         plan = recs.plan_remove(z["name"], z["group"], n, t, value, held)
-        return self._send(api, z, plan)
+        report = self._send(api, z, plan)
+        if plan.changed and t == "A" and plan.records is None:
+            fqdn = z["name"].lower() if n == "@" else f"{n}.{z['name']}".lower()
+            if fqdn in {h.fqdn for h in self.ddns_hosts(self.config())[0]}:
+                report["lines"].append(f"{fqdn} is still a Dynamic DNS host: its next pass makes its A record again "
+                                       f"(take it out of {settings_mod.DDNS_HOSTS} to stop that)")
+        return report
 
-    def _types_at(self, api: AzureApi, z: dict, name: str) -> list[str]:
+    def _types_at(self, api: AzureApi, snap: model.Snapshot | None, z: dict, name: str) -> list[str]:
         """The record types a name holds in a zone (as last read; read now when the zone was not)."""
-        snap = self.snapshot()
         held = snap.records.get(z["key"]) if snap is not None else None
         if not isinstance(held, list):
             held = api.record_sets(z["group"], z["name"])
@@ -464,40 +563,53 @@ class AzurePlugin(MachinePlugin):
 
     def add_rule(self, group: str, nsg: str, name: str, direction: str, access: str, protocol: str, ports: str,
                  source=None, destination=None, priority=None, description=None, accept_risky=False) -> dict:
-        """A security rule added to a network security group (a new name, a priority no rule of its direction holds);
-        one opening SSH, RDP or every port to the whole internet, or denying SSH or RDP on a group attached to a VM, only
-        once that is accepted (accept_risky)."""
+        """A security rule added to a network security group, the group read just before: a rule of that name (made since
+        the last read too) or a priority another rule of its direction holds is refused, and none is ever replaced (sent
+        with If-None-Match: *). One opening every port or a service of rules.RISKY to the whole internet, or denying SSH
+        or RDP on a group attached to a VM, only once that is accepted (accept_risky, exactly true)."""
         g = self._nsg(group, nsg)
         rule = nsg_rules.rule_of(name, direction, access, protocol, ports, source, destination, priority, description)
-        if any(r.name.lower() == rule.name.lower() for r in g["rules"]):
-            raise Refusal(f"{g['name']} has a rule named {rule.name} already: remove it first, or name this one otherwise")
-        taken = next((r for r in g["rules"] if r.direction == rule.direction and r.priority == rule.priority), None)
+        api = self.client()
+        rules_now, _, servers = self._nsg_now(api, g)
+        if any(r.name.lower() == rule.name.lower() for r in rules_now):
+            raise Refusal(f"{g['name']} has a rule named {rule.name} (read just now): it is never replaced here; remove it "
+                          "first, or name this one otherwise")
+        taken = next((r for r in rules_now if r.direction == rule.direction and r.priority == rule.priority), None)
         if taken is not None:
             raise Refusal(f"priority {rule.priority} is {taken.name}'s ({rule.direction.lower()}): each rule's is its own")
-        risk = nsg_rules.risk_of_adding(rule, g["servers"])
-        if risk and not accept_risky:
+        risk = nsg_rules.risk_of_adding(rule, servers)
+        if risk and not accepted(accept_risky):
             raise Refusal(f"{nsg_rules.said(rule)}: {risk}. It is added only once that is accepted ({ACCEPT_RISKY})",
                           accept=ACCEPT_RISKY)
-        answer = self.client().put_rule(g["group"], g["name"], rule)
+        try:
+            answer = api.put_rule(g["group"], g["name"], rule)
+        except RestError as e:
+            if e.status == 412:  # made meanwhile, between the read and the write: not replaced
+                raise Refusal(f"a rule named {rule.name} was made in {g['name']} meanwhile: it is not replaced") from None
+            raise
         made = nsg_rules.parse(answer) if answer else rule
         self._replace_rule(g, made)
         return {"nsg": g["name"], "group": g["group"], "rule": made.as_dict(), "ok": True, "said": f"added {nsg_rules.said(made)}",
                 "lines": [*([f"{risk} (accepted)"] if risk else []), f"{g['name']}'s other rules were left as they were"]}
 
     def remove_rule(self, group: str, nsg: str, name: str, accept_risky=False) -> dict:
-        """A security rule removed (the group's own default rules cannot be); the rule letting SSH or RDP in to a VM the
-        group is attached to only once that is accepted (accept_risky)."""
+        """A security rule removed, the group read just before (its default rules cannot be); the rule letting SSH or RDP
+        in to a VM the group is attached to, or a Deny keeping a later rule from opening a risky service to the whole
+        internet, only once that is accepted (accept_risky, exactly true)."""
         g = self._nsg(group, nsg)
-        rule = next((r for r in g["rules"] if r.name.lower() == str(name or "").strip().lower()), None)
+        api = self.client()
+        rules_now, defaults_now, servers = self._nsg_now(api, g)
+        wanted = str(name or "").strip().lower()
+        rule = next((r for r in rules_now if r.name.lower() == wanted), None)
         if rule is None:
-            if any(r.name.lower() == str(name or "").strip().lower() for r in g["defaults"]):
+            if any(r.name.lower() == wanted for r in defaults_now or g["defaults"]):
                 raise Refusal(f"{name} is one of {g['name']}'s default rules: those cannot be removed")
-            raise Refusal(f"{g['name']} has no rule named {name} as last read: Refresh first")
-        risk = nsg_rules.risk_of_removing(rule, g["servers"])
-        if risk and not accept_risky:
+            raise Refusal(f"{g['name']} has no rule named {name} (read just now)")
+        risk = nsg_rules.risk_of_removing(rule, servers, others=rules_now)
+        if risk and not accepted(accept_risky):
             raise Refusal(f"{nsg_rules.said(rule)}: {risk}. It is removed only once that is accepted ({ACCEPT_RISKY})",
                           accept=ACCEPT_RISKY)
-        self.client().delete_rule(g["group"], g["name"], rule.name)
+        api.delete_rule(g["group"], g["name"], rule.name)
         self._replace_rule(g, None, gone=rule.name)
         return {"nsg": g["name"], "group": g["group"], "ok": True, "said": f"removed {nsg_rules.said(rule)}",
                 "lines": [*([f"{risk} (accepted)"] if risk else []), f"{g['name']}'s other rules were left as they were"]}
@@ -508,6 +620,22 @@ class AzurePlugin(MachinePlugin):
             raise ValueError(f"{name} in {group} is none of the subscription's network security groups as last read: Refresh first")
         return g
 
+    def _nsg_now(self, api: AzureApi, g: dict) -> tuple[list, list, list[str]]:
+        """A network security group read again just before a change: its rules, its default rules, and the VMs it is
+        attached to (by name as last read; said as its interfaces or subnets when it was attached since)."""
+        data = api.nsg(g["group"], g["name"])
+        if data is None:
+            raise Refusal(f"{g['name']} is not in {g['group']} any more (read just now): Refresh")
+        props = data.get("properties") if isinstance(data.get("properties"), Mapping) else {}
+        rules_now = sorted((nsg_rules.parse(r) for r in props.get("securityRules") or [] if isinstance(r, Mapping)),
+                           key=lambda r: (r.direction != "Inbound", r.priority, r.name.lower()))
+        defaults_now = [nsg_rules.parse(r, default=True) for r in props.get("defaultSecurityRules") or [] if isinstance(r, Mapping)]
+        attached = bool(props.get("networkInterfaces") or props.get("subnets"))
+        servers = (list(g["servers"]) or ["the network interfaces or subnets it is attached to"]) if attached else []
+        with self._rt.lock:
+            g["rules"] = rules_now
+        return rules_now, defaults_now, servers
+
     def _replace_rule(self, g: dict, rule, gone: str | None = None) -> None:
         with self._rt.lock:
             rules = [r for r in g["rules"] if r.name.lower() != (gone or (rule.name if rule else "")).lower()]
@@ -516,21 +644,30 @@ class AzurePlugin(MachinePlugin):
             g["rules"] = sorted(rules, key=lambda r: (r.direction != "Inbound", r.priority, r.name.lower()))
 
     def add_ssh_key(self, group: str, name: str, public_key: str, location=None) -> dict:
-        """An SSH public key stored in Azure (RSA of 2048 bits or more, or ED25519), in a resource group of the
-        subscription (in its location unless one is named)."""
+        """An SSH public key stored in Azure (RSA of 2048 bits or more, or ED25519; a private key refused without a word of
+        it said back), in a resource group of the subscription (in its location unless one is named). A key of that name
+        (made since the last read too) is refused, and none is ever replaced (sent with If-None-Match: *)."""
         snap = self._held()
         g = snap.group(group)
         if g is None:
             raise ValueError(f"{group} is none of the subscription's resource groups as last read: Refresh first")
         n = model.key_name(name)
-        if snap.key(g["name"], n) is not None:
-            raise Refusal(f"{g['name']} holds an SSH key named {n} already: remove it first, or name this one otherwise")
         line, described = model.check_key(public_key)
+        api = self.client()
+        if api.ssh_key(g["name"], n) is not None:
+            raise Refusal(f"{g['name']} holds an SSH key named {n} (read just now): it is never replaced here; remove it "
+                          "first, or name this one otherwise")
         where = "".join(str(location or "").split()).lower() or g["location"]
-        answer = self.client().put_ssh_key(g["name"], n, where, line)
+        try:
+            answer = api.put_ssh_key(g["name"], n, where, line)
+        except RestError as e:
+            if e.status == 412:
+                raise Refusal(f"an SSH key named {n} was made in {g['name']} meanwhile: it is not replaced") from None
+            raise
         made = model.keys_of([answer])[0] if answer else {"name": n, "group": g["name"], "location": where, "key": described}
         with self._rt.lock:
-            snap.keys = sorted([*snap.keys, made], key=lambda k: (k["group"].lower(), k["name"].lower()))
+            snap.keys = sorted([*(k for k in snap.keys if not (k["group"].lower() == g["name"].lower() and k["name"] == n)), made],
+                               key=lambda k: (k["group"].lower(), k["name"].lower()))
         return {"key": made, "ok": True, "said": f"stored the SSH key {n} in {g['name']}", "lines": [described]}
 
     def remove_ssh_key(self, group: str, name: str) -> dict:
@@ -544,19 +681,31 @@ class AzurePlugin(MachinePlugin):
             snap.keys = [x for x in snap.keys if x is not k]
         return {"ok": True, "said": f"removed the SSH key {k['name']} from {k['group']}", "lines": [k["key"]]}
 
-    # -- Dynamic DNS through Azure DNS -----------------------------------------------------------------------------------------
-    def _ddns_zone(self, host: dyndns.Host) -> dict:
-        snap = self.snapshot()
-        z = next((x for x in (snap.zones if snap is not None else []) if x["name"].lower() == host.zone), None)
-        if z is None:
+    # -- Dynamic DNS through Azure DNS (the library's Keeper) -----------------------------------------------------------------
+    @staticmethod
+    def _ddns_zone(snap: model.Snapshot, host: dyndns.Host) -> dict:
+        """The zone a host is kept in: the one of its name (a name two resource groups hold is refused: which is live is
+        not the plugin's to guess)."""
+        found = [x for x in snap.zones if x["name"].lower() == host.zone]
+        if not found:
             raise ValueError(f"{host.zone} is none of the subscription's Azure DNS zones as last read")
-        return z
+        if len(found) > 1:
+            raise ValueError(f"{host.zone} is a zone in {len(found)} resource groups ({', '.join(z['group'] for z in found)}): "
+                             "Dynamic DNS writes to none of them")
+        return found[0]
+
+    def _passing(self) -> _Pass:
+        ctx = getattr(self._rt.passing, "current", None)
+        if ctx is None:
+            raise RuntimeError("no Dynamic DNS pass is under way")
+        return ctx
 
     def _ddns_read(self, host: dyndns.Host) -> list[str] | None:
-        z = self._ddns_zone(host)
-        held = self.client().record_set(z["group"], z["name"], "A", host.name)
-        with self._rt.lock:
-            self._rt.seen[host.fqdn] = held
+        """A host's A record set as it is now (the Keeper's read): its addresses ([] when it has none)."""
+        ctx = self._passing()
+        z = self._ddns_zone(ctx.snap, host)
+        held = ctx.api.record_set(z["group"], z["name"], "A", host.name)
+        ctx.seen[host.fqdn] = held
         if held is None:
             return []
         if held.unwritable:
@@ -564,56 +713,107 @@ class AzurePlugin(MachinePlugin):
         return held.values
 
     def _ddns_write(self, host: dyndns.Host, address: str) -> str:
-        z = self._ddns_zone(host)
-        api = self.client()
-        with self._rt.lock:
-            seen = host.fqdn in self._rt.seen
-            held = self._rt.seen.pop(host.fqdn, None)
-        if not seen:
-            held = api.record_set(z["group"], z["name"], "A", host.name)
-        if host.name != "@" and held is None and "CNAME" in self._types_at(api, z, host.name):
+        """A host's A record set holding this network's address alone (the Keeper's write), with the etag it was read with
+        (a new one If-None-Match: *); nothing once the plugin is detached."""
+        ctx = self._passing()
+        if ctx.stop is not None and ctx.stop.is_set():
+            raise RuntimeError("the plugin was detached: nothing written")
+        z = self._ddns_zone(ctx.snap, host)
+        held = ctx.seen.pop(host.fqdn) if host.fqdn in ctx.seen else ctx.api.record_set(z["group"], z["name"], "A", host.name)
+        if host.name != "@" and held is None and "CNAME" in self._types_at(ctx.api, ctx.snap, z, host.name):
             raise Refusal(f"{host.fqdn} is a CNAME: it holds no A record beside it")
         plan = recs.plan_address(z["name"], z["group"], host.name, address, held)
-        after = api.put_record_set(plan)
+        after = ctx.api.put_record_set(plan)
         self._replace_set(z, plan, after)
         return plan.said
 
     def ddns_hosts(self, cfg: Config) -> tuple[list, list]:
-        """The Dynamic DNS hosts in the subscription's zones (as last read), and the entries in none, in words."""
-        snap = self.snapshot()
+        """The Dynamic DNS hosts in the subscription's zones (as last read), and the entries in none, in words (with
+        every setting's value taken out: a secret pasted into the hosts is never shown)."""
+        snap = self._snap_of(cfg)
         if snap is None:
             return [], []
-        return dyndns.hosts_of(", ".join(cfg.hosts), zones=[z["name"] for z in snap.zones])
+        hosts, wrong = dyndns.hosts_of(", ".join(cfg.hosts), zones=[z["name"] for z in snap.zones])
+        secrets = [*cfg.secrets, *(s.lower() for s in cfg.secrets)]
+        return hosts, [scrub(w, secrets) for w in wrong]
 
-    def ddns_update(self, force: bool = True) -> list[dict]:
-        """A Dynamic DNS pass now (the page's Update DNS now: `force`, every host's record set written; the command
-        line's `ddns` without --now writes only where it differs)."""
-        cfg = self.config(fresh=True)
-        if not cfg.ddns_ready:
-            raise ValueError("Dynamic DNS is not set up: " + (f"{settings_mod.DDNS_HOSTS} is not set" if cfg.api_ready else
-                                                              "the API is not set up (" + ", ".join(CREDENTIALS) + ")"))
-        if self.snapshot() is None:
-            self.refresh()
-        hosts, wrong = self.ddns_hosts(cfg)
-        if not hosts:
-            raise ValueError("no Dynamic DNS host is in the subscription's Azure DNS zones" + (f": {'; '.join(wrong)}" if wrong else ""))
-        out = self.keeper().run_pass(hosts, force=bool(force))
+    def _ddns_pass(self, cfg: Config, hosts: list, force: bool = False, stop: threading.Event | None = None,
+                   wait: float = 120.0) -> list[dict]:
+        """A Dynamic DNS pass over `hosts` with these settings (none read again during it), the zones as last read, and
+        `stop` (the plugin detached ends it before its next write). The hosts taken out of the settings are let go."""
+        snap = self._snap_of(cfg)
+        if snap is None:
+            raise ValueError("the subscription's zones are not read yet")
+        keeper = self.keeper()
+        named = {_fqdn(text) for text in cfg.hosts}  # as set, whatever zones were read (a zone not read lets none go)
+        known = getattr(keeper, "known", None)  # liminal-libs 1.49.4: every host it holds, from before a restart too
+        with self._rt.lock:
+            held = set(known()) if callable(known) else set(self._rt.ddns_had)
+            gone, self._rt.ddns_had = held - named, {h.fqdn for h in hosts} | (self._rt.ddns_had & named)
+        for fqdn in sorted(gone):
+            keeper.let_go(fqdn)
+        self._rt.passing.current = _Pass(cfg, self._client_for(cfg), snap, stop)
+        try:
+            out = keeper.run_pass(hosts, force=bool(force), wait=wait, stop=stop)
+        finally:
+            self._rt.passing.current = None
         with self._rt.lock:
             self._rt.ddns_print, self._rt.ddns_at = cfg.ddns_print, self._clock()
         return out
 
+    def _ddns_ready(self, cfg: Config) -> list:
+        """The hosts a pass asked now goes over (the subscription read first when it was not); ValueError when none."""
+        if not cfg.ddns_ready:
+            raise ValueError("Dynamic DNS is not set up: " + (f"{settings_mod.DDNS_HOSTS} is not set" if cfg.api_ready else
+                                                              "the API is not set up (" + ", ".join(CREDENTIALS) + ")"))
+        if self._snap_of(cfg) is None:
+            self.refresh()
+        hosts, wrong = self.ddns_hosts(cfg)
+        if not hosts:
+            raise ValueError("no Dynamic DNS host is in the subscription's Azure DNS zones" + (f": {'; '.join(wrong)}" if wrong else ""))
+        return hosts
+
+    def ddns_update(self, force: bool = True) -> list[dict]:
+        """A Dynamic DNS pass now (the page's Update DNS now, confirmed: `force`, every host that is the keeper's own
+        written whether it differs or not, never one holding another address; the command line's `ddns` without --now
+        writes only where it differs)."""
+        cfg = self.config(fresh=True)
+        hosts = self._ddns_ready(cfg)
+        return self._ddns_pass(cfg, hosts, force=bool(force), stop=self._rt.stop)
+
+    def ddns_take_over(self, host: str, holds=None) -> dict:
+        """A host the keeper left as it is (it holds another address, or several) taken over (the page's Take over…, once
+        confirmed: its words name what it holds), then a pass for that host: its A record set to this network's address
+        alone, and kept there."""
+        cfg = self.config(fresh=True)
+        hosts = self._ddns_ready(cfg)
+        want = str(host or "").strip().rstrip(".").lower()
+        h = next((x for x in hosts if x.fqdn == want), None)
+        if h is None:
+            raise ValueError(f"{host} is none of the Dynamic DNS hosts in the subscription's zones ({settings_mod.DDNS_HOSTS})")
+        keeper = self.keeper()
+        keeper.take_over(h.fqdn)
+        out = self._ddns_pass(cfg, [h], force=False, stop=self._rt.stop)
+        st = out[0] if out else {}
+        lines = [f"it held {holds}" if holds else "", "kept at this network's address from now on"]
+        return {"host": h.fqdn, "ok": bool(st.get("ok")), "said": f"{h.fqdn} taken over: {st.get('result') or 'set on the next pass'}",
+                "lines": [x for x in lines if x], "state": st}
+
     # -- attached: the reading in the background ------------------------------------------------------------------------------
     def attach(self, app, login=None) -> dict:
-        """Attached by the platform: its settings asked of the platform's login from now on; the subscription read and the
-        Dynamic DNS hosts checked in the background."""
+        """Attached: its settings asked of the app's login from now on. By the platform, the subscription read and the
+        Dynamic DNS hosts checked in the background; by any other app (the charts app run alone attaches every plugin it
+        finds), nothing of it runs on its own."""
         interface = super().attach(app, login)
         with self._rt.lock:
             self._rt.config = None
-        self._start()
+        if getattr(app, "NAME", "") == "platform":
+            self._start()
         return interface
 
     def detach(self) -> None:
-        """Detached (the platform ending, the plugin disabled or not valid): the background reading ends."""
+        """Detached (the platform ending, the plugin disabled or not valid): the background reading ends, and a pass under
+        way writes nothing more."""
         self._stop()
         super().detach()
         with self._rt.lock:
@@ -646,56 +846,63 @@ class AzurePlugin(MachinePlugin):
             t.join(timeout=10)
 
     def _work(self, stop: threading.Event) -> None:
-        """The background: the subscription read every REFRESH_S, the VMs' states soon after a power change, the Dynamic
-        DNS hosts checked every AZURE_DDNS_MINUTES; nothing done for what is not set."""
+        """The background: the subscription read every REFRESH_S (a read failed for a passing reason again after
+        RETRY_SOON_S, then twice as long each time), the VMs' states soon after a power change, the Dynamic DNS hosts
+        checked every AZURE_DDNS_MINUTES once the zones are read; nothing done for what is not set."""
         next_api = next_ddns = 0.0
+        failures = 0
         while not stop.is_set():
             now = time.monotonic()
             cfg = None
+            snap = None
             try:
                 cfg = self.config()
                 with self._rt.lock:
                     soon = self._rt.soon
                 if cfg.api_ready and now >= next_api:
-                    next_api = now + REFRESH_S
                     if self._rt.refreshing.acquire(blocking=False):  # Refresh asked meanwhile: that one is enough
                         try:
                             self._refresh(cfg)
+                            failures, next_api = 0, now + REFRESH_S
                             with self._rt.lock:
                                 self._rt.soon = None
-                        except Exception:  # noqa: BLE001 - kept as its outcome (api_error), shown by the status
-                            pass
+                        except Exception as e:  # noqa: BLE001 - kept as its outcome (api_error), shown by the status
+                            failures += 1
+                            next_api = now + (min(REFRESH_S, RETRY_SOON_S * 2 ** (failures - 1)) if transient(e) else REFRESH_S)
                         finally:
                             self._rt.refreshing.release()
+                    else:
+                        next_api = now + REFRESH_S
                 elif cfg.api_ready and soon is not None and now >= soon:
                     with self._rt.lock:
                         self._rt.soon = None
                     try:
-                        self._reread_states()
+                        self._reread_states(cfg)
                     except Exception:  # noqa: BLE001 - the next refresh reads them anyway
                         pass
-                if cfg.ddns_ready and now >= next_ddns and self.snapshot() is not None:
+                snap = self._snap_of(cfg)
+                if cfg.ddns_ready and snap is not None and now >= next_ddns and not stop.is_set():
                     next_ddns = now + cfg.minutes * 60.0
                     hosts, _ = self.ddns_hosts(cfg)
-                    try:
-                        self.keeper().run_pass(hosts, force=False, wait=0.5)
-                        with self._rt.lock:
-                            self._rt.ddns_print, self._rt.ddns_at = cfg.ddns_print, self._clock()
-                    except Exception:  # noqa: BLE001 - a pass under way (Update DNS now), or its trouble kept by the hosts
-                        pass
+                    if hosts:  # none in the subscription's zones: not even this network's address is asked
+                        try:
+                            self._ddns_pass(cfg, hosts, force=False, stop=stop, wait=0.5)
+                        except Exception:  # noqa: BLE001 - a pass under way (Update DNS now), or its trouble kept by the hosts
+                            pass
             except Exception:  # noqa: BLE001 - the background never ends on a trouble; the status says it
                 pass
             with self._rt.lock:
                 soon = self._rt.soon
+            ddns_due = cfg is not None and cfg.ddns_ready and snap is not None
             due = [t for t, on in ((next_api, cfg is not None and cfg.api_ready), (soon or 0.0, soon is not None),
-                                   (next_ddns, cfg is not None and cfg.ddns_ready)) if on]
+                                   (next_ddns, ddns_due)) if on]
             wait = min([60.0, *(t - time.monotonic() for t in due)])
             self._rt.wake.wait(max(1.0, wait))
             self._rt.wake.clear()
 
-    def _reread_states(self) -> None:
+    def _reread_states(self, cfg: Config) -> None:
         """The VMs' power states read again (one request: List All with statusOnly)."""
-        api = self.client()
+        api = self._client_for(cfg)
         statuses = api.vm_statuses()
         power = {}
         for s in statuses:
@@ -750,7 +957,8 @@ class AzurePlugin(MachinePlugin):
     # -- what the platform's page shows ------------------------------------------------------------------------------------
     def status(self) -> dict:
         """What was read last, asking nothing of Azure: the settings set (by name), the summary, valid (set up, and the
-        last read worked or is untried) and why not, the facts, the tables, the actions and the forms."""
+        last read worked, is untried, or failed for a passing reason: said as a problem and tried again soon) and why
+        not, the facts, the tables, the actions and the forms."""
         cfg = self.config()
         if not cfg.present:
             return {"present": False, "valid": False, "why": NOT_SET, "summary": "not set up", "settingsNotSet": ", ".join(NAMES),
@@ -759,27 +967,33 @@ class AzurePlugin(MachinePlugin):
         with rt.lock:
             snap = rt.snap if rt.snap_print == cfg.api_print else None
             api_ok, api_error, api_error_at, api_print = rt.api_ok, rt.api_error, rt.api_error_at, rt.api_print
+            passing = rt.api_transient
             cost, cost_at, cost_error, keeper, ddns_print = rt.cost, rt.cost_at, rt.cost_error, rt.keeper, rt.ddns_print
         prices = {v["key"]: self._price_for(v) for v in snap.vms} if snap is not None else {}
         notes = [*cfg.incomplete, *cfg.problems]
         out: dict = {"present": True}
+        failing = False
         if not cfg.api_ready:
             out.update({"valid": False, "why": "; ".join(notes) or NOT_SET, "summary": "set up halfway"})
             works = False
         else:
             works = api_ok if api_print == cfg.api_print else None
-            if works is False and not attached and api_error_at is not None and now - api_error_at >= RETRY_S:
+            failing = works is False and passing  # a passing failure: still valid, tried again soon
+            if works is False and not failing and not attached and api_error_at is not None and now - api_error_at >= RETRY_S:
                 works = None  # tried again once the platform attaches it
-            out["valid"] = works is not False
-            if works is False:
+            out["valid"] = works is not False or failing
+            if not out["valid"]:
                 out["why"] = f"the API: {api_error}"
         hosts, wrong = self.ddns_hosts(cfg) if cfg.ddns_ready else ([], [])
         states = {s.fqdn.lower(): s for s in (keeper.states() if keeper is not None else [])}
         tried = [states[h.fqdn] for h in hosts if h.fqdn in states and states[h.fqdn].ok is not None]
         ddns_troubles = [f"{s.fqdn}: {s.result}" for s in tried if s.ok is False and ddns_print == cfg.ddns_print]
-        if out["valid"] and (notes or wrong or ddns_troubles):
-            out["problem"] = "; ".join([*notes, *(f"Dynamic DNS: {w}" for w in wrong), *(f"Dynamic DNS: {t}" for t in ddns_troubles)])
-        out["summary"] = self._summary(cfg, works, api_error, attached, snap, cost, hosts, states)
+        troubles = ([f"the last read failed ({when(api_error_at)}) and is tried again within minutes: {api_error}"]
+                    if failing else [])
+        if out["valid"] and (troubles or notes or wrong or ddns_troubles):
+            out["problem"] = "; ".join([*troubles, *notes, *(f"Dynamic DNS: {w}" for w in wrong),
+                                        *(f"Dynamic DNS: {t}" for t in ddns_troubles)])
+        out["summary"] = self._summary(cfg, works, failing, api_error, attached, snap, cost, hosts, states)
         out["settingsSet"] = ", ".join(n for n in NAMES if n in cfg.present)
         missing = [n for n in NAMES if n not in cfg.present]
         if missing:
@@ -799,22 +1013,25 @@ class AzurePlugin(MachinePlugin):
         out["billing"] = BILLING
         if cfg.ddns_ready:
             out["ddnsEvery"] = f"every {cfg.minutes:g} min" + ("" if attached else ", once attached")
-        writable = bool(cfg.api_ready) and works is not False and snap is not None
+        writable = bool(cfg.api_ready) and out["valid"] and snap is not None
         out["tables"] = self._tables(cfg, snap, prices, hosts, writable, attached)
         out["forms"] = self._forms(snap) if writable else []
+        if writable and cfg.ddns_ready:
+            keeper = self.keeper()
+            out["forms"] += [keeper.take_form(), keeper.now_form()]
         out["actions"] = ([{"hook": "refresh", "args": [], "title": "Refresh",
                             "note": "the subscription read again now (a dozen requests or so)"}] if cfg.api_ready else []) + \
-                         ([{"hook": "ddns_update", "args": [], "title": "Update DNS now",
-                            "note": "every Dynamic DNS host's A record set written now with this network's address"}]
-                          if cfg.ddns_ready and hosts else [])
+                         ([{"form": dyndns.NOW_FORM, "title": "Update DNS now"}] if writable and cfg.ddns_ready and hosts else [])
         return out
 
-    def _summary(self, cfg, works, error, attached, snap, cost, hosts, states) -> str:
+    def _summary(self, cfg, works, failing, error, attached, snap, cost, hosts, states) -> str:
         if not cfg.api_ready:
             return "set up halfway"
-        if works is False:
+        if works is False and not failing:
             return f"the API: {error[:120]}"
         if snap is None:
+            if failing:
+                return "the first read failed: it is tried again within minutes"
             return "reading the subscription…" if attached else "the subscription is read once attached"
         running = sum(1 for v in snap.vms if v["power"] == "running")
         bits = [plural(len(snap.vms), "VM") + (f" ({running} running)" if snap.vms else ""), plural(len(snap.zones), "DNS zone")]
@@ -828,21 +1045,21 @@ class AzurePlugin(MachinePlugin):
                 bits.append(f"Dynamic DNS: {sum(1 for s in mine if s.ok)} of {plural(len(hosts), 'host')} current")
             else:
                 bits.append("Dynamic DNS: the first check is under way" if attached else "Dynamic DNS: checked once attached")
+        if failing:
+            bits.append("the last read failed: tried again soon")
         return " · ".join(bits)
 
     def _tables(self, cfg, snap, prices, hosts, writable, attached) -> list:
         out = []
         if cfg.ddns_ready:
-            table = self.keeper().table(hosts, cfg.minutes, attached=attached)
-            if snap is None:
-                table["empty"] = "The subscription's zones are read first."
-            out.append(table)
+            out.append(self.keeper().table(hosts, cfg.minutes, attached=attached, take=writable,
+                                           empty=None if snap is not None else "The subscription's zones are read first."))
         if snap is None:
             return out
         out.append(page.vm_table(snap, prices, writable))
         out += page.nsg_tables(snap, writable)
         out += page.zone_tables(snap, writable)
-        out.append(page.key_table(snap, writable))
+        out.append(page.key_table(snap, writable and not snap.troubles.get("keys")))
         out.append(page.ip_table(snap))
         out.append(page.disk_table(snap))
         out.append(page.group_table(snap))
@@ -856,7 +1073,7 @@ class AzurePlugin(MachinePlugin):
             forms += page.rule_forms(g)
         for z in page.zones_writable(snap):
             forms += page.record_forms(z)
-        if snap.groups:
+        if snap.groups and not snap.troubles.get("keys"):  # the keys not read: none is added blind
             forms += page.key_forms(snap.groups)
         return forms
 

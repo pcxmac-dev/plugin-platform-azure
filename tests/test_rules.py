@@ -43,7 +43,9 @@ def test_the_risk_of_adding_a_rule():
     assert r.risk_of_adding(make(), []) == "it opens SSH (port 22) to the whole internet"
     assert r.risk_of_adding(make(ports="3389", source="Internet"), []) == "it opens RDP (port 3389) to the whole internet"
     assert r.risk_of_adding(make(ports="*", source="0.0.0.0/0"), []) == "it opens every port to the whole internet"
-    assert r.risk_of_adding(make(ports="20-25", source="::/0"), []) == "it opens SSH (port 22) to the whole internet"
+    assert r.risk_of_adding(make(ports="20-25", source="::/0"), []) == "it opens SSH (port 22) and Telnet (port 23) to the whole internet"
+    assert r.risk_of_adding(make(ports="5432", source="Internet"), []) == "it opens PostgreSQL (port 5432) to the whole internet"
+    assert r.risk_of_adding(make(ports="2375-2376"), []) == "it opens Docker's API (port 2375) and Docker's API (TLS) (port 2376) to the whole internet"
     assert r.risk_of_adding(make(source="203.0.113.7"), ["vm1"]) == ""  # SSH from one address: no risk
     assert r.risk_of_adding(make(ports="443"), ["vm1"]) == ""  # HTTPS to the world: what it is for
     assert r.risk_of_adding(make(protocol="Udp"), []) == ""  # port 22 over UDP is not SSH
@@ -52,9 +54,25 @@ def test_the_risk_of_adding_a_rule():
     assert r.risk_of_adding(make(access="Deny"), []) == ""  # a group attached to no VM cuts no one off
 
 
+def test_a_source_left_empty_is_refused_never_taken_as_everywhere():
+    """An empty Source opened the whole internet unasked (the audit, 2026-11-11): it must be named, * or Internet."""
+    with pytest.raises(ValueError, match="no source given"):
+        make(source="")
+    with pytest.raises(ValueError, match="no source given"):
+        make(source=None)
+    assert make(destination="").destinations == ["*"]  # a destination may be left as any
+
+
 def test_the_risk_of_removing_a_rule():
     ssh = make(source="203.0.113.7")
     assert r.risk_of_removing(ssh, ["vm1", "vm2"]).startswith("it is the rule letting SSH (port 22) in to vm1, vm2")
     assert r.risk_of_removing(ssh, []) == ""
     assert r.risk_of_removing(make(ports="80"), ["vm1"]) == ""
     assert r.risk_of_removing(make(ports="*", protocol="*"), ["vm1"]).startswith("it is the rule letting SSH (port 22) and RDP")
+    # a Deny ahead of an Allow from everywhere: removing it opens what the Allow lets in
+    deny = make(name="deny-db", access="Deny", ports="5432", priority=200)
+    allow = make(name="allow-db", ports="5432", source="*", priority=300)
+    assert r.risk_of_removing(deny, [], others=[deny, allow]) == "without it, a later rule opens PostgreSQL (port 5432) to the whole internet"
+    assert r.risk_of_removing(deny, [], others=[deny]) == ""  # nothing behind it opens anything
+    earlier = make(name="allow-db", ports="5432", source="*", priority=100)
+    assert r.risk_of_removing(deny, [], others=[deny, earlier]) == ""  # the Allow came first anyway: nothing changes

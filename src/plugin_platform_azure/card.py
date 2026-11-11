@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from liminal_libs.sources.apis import Api, Area, Call, Link
 
-from .api import (COST, DISKS, GROUPS, NICS, NSGS, PUBLIC_IPS, RECORD_SET, RESOURCES, RETAIL, RULE, SSH_KEY, SSH_KEYS,
+from .api import (COST, DISKS, GROUPS, NICS, NSG, NSGS, PUBLIC_IPS, RECORD_SET, RESOURCES, RETAIL, RULE, SSH_KEY, SSH_KEYS,
                   SUBSCRIPTION, TOKEN, V_COMPUTE, V_COST, V_DISKS, V_DNS, V_NETWORK, V_PRICES, V_RESOURCES, V_SUBSCRIPTIONS,
                   VM, VM_DEALLOCATE, VM_POWER_OFF, VM_RESTART, VM_START, VM_VIEW, VMS, ZONE_ALL, ZONES)
 
@@ -158,10 +158,12 @@ ARM = Api(
         call("GET", VMS, "Virtual Machines - List All (and with statusOnly=true, every VM's power state at once)",
              "Virtual machines", "the Virtual machines table and their power states", f"{COMPUTE}/virtual-machines/list-all"),
         call("GET", VM_VIEW, "Virtual Machines - Instance View: a VM's run-time state", "Virtual machines",
-             "a power state the list did not give", f"{COMPUTE}/virtual-machines/instance-view"),
+             "a power state the list did not give; a VM's state read just before it is started",
+             f"{COMPUTE}/virtual-machines/instance-view"),
         call("POST", VM_START, "Virtual Machines - Start: starts the compute charge again for a deallocated VM (a stopped "
              "one was billing all along)", "Virtual machines",
-             "Start… (its confirmation says which applies to that VM, from its power state as read)",
+             "Start… (its state read just before: a start that starts the compute charge again is asked twice, its "
+             "price said)",
              f"{COMPUTE}/virtual-machines/start", writes=True, costs=True),
         call("POST", VM_RESTART, "Virtual Machines - Restart", "Virtual machines", "Restart…", f"{COMPUTE}/virtual-machines/restart",
              writes=True),
@@ -172,8 +174,10 @@ ARM = Api(
         call("GET", DISKS, "Disks - List", "Disks", "the Disks table", f"{COMPUTE}/disks/list"),
         call("GET", SSH_KEYS, "SSH Public Keys - List By Subscription", "SSH public keys", "the SSH keys table",
              f"{COMPUTE}/ssh-public-keys/list-by-subscription"),
-        call("PUT", SSH_KEY, "SSH Public Keys - Create: a public key kept as a resource (free)", "SSH public keys",
-             "Add an SSH key…", f"{COMPUTE}/ssh-public-keys/create"),
+        call("GET", SSH_KEY, "SSH Public Keys - Get", "SSH public keys", "a key of that name looked for just before one is added",
+             f"{COMPUTE}/ssh-public-keys/get"),
+        call("PUT", SSH_KEY, "SSH Public Keys - Create: a public key kept as a resource (free); sent with If-None-Match: * "
+             "so none of its name is replaced", "SSH public keys", "Add an SSH key…", f"{COMPUTE}/ssh-public-keys/create"),
         call("DELETE", SSH_KEY, "SSH Public Keys - Delete", "SSH public keys", "Remove (a key)", f"{COMPUTE}/ssh-public-keys/delete"),
         call("GET", NICS, "Network Interfaces - List All", "Network interfaces", "which VM each address and security group is on",
              f"{NETWORK}/network-interfaces/list-all"),
@@ -181,8 +185,11 @@ ARM = Api(
              f"{NETWORK}/public-ip-addresses/list-all"),
         call("GET", NSGS, "Network Security Groups - List All (their rules with them)", "Network security groups",
              "the tables of each group's rules", f"{NETWORK}/network-security-groups/list-all"),
-        call("PUT", RULE, "Security Rules - Create Or Update", "Security rules", "Add a rule… (a new name only)",
-             f"{NETWORK}/security-rules/create-or-update"),
+        call("GET", NSG, "Network Security Groups - Get", "Network security groups",
+             "the group read just before a rule is added or removed (its rules and attachments as they are now)",
+             f"{NETWORK}/network-security-groups/get"),
+        call("PUT", RULE, "Security Rules - Create Or Update; sent with If-None-Match: * so none of its name is replaced",
+             "Security rules", "Add a rule… (a new name only)", f"{NETWORK}/security-rules/create-or-update"),
         call("DELETE", RULE, "Security Rules - Delete", "Security rules", "Remove (a rule)", f"{NETWORK}/security-rules/delete"),
         call("POST", COST, "Query - Usage: costs by scope (a read, by POST)", "Cost Management",
              "the cost this month so far, every six hours", f"{REST}/cost-management/query/usage"),
@@ -213,11 +220,10 @@ ARM = Api(
              f"{NETWORK}/public-ip-addresses/create-or-update", costs=True),
         call("DELETE", RG + "/providers/Microsoft.Network/publicIPAddresses/{publicIpAddressName}", "Public IP Addresses - Delete",
              "Public IP addresses", "", f"{NETWORK}/public-ip-addresses/delete"),
-        call("PUT", RG + "/providers/Microsoft.Network/networkSecurityGroups/{networkSecurityGroupName}",
-             "Network Security Groups - Create Or Update", "Network security groups", "",
+        call("PUT", NSG, "Network Security Groups - Create Or Update", "Network security groups", "",
              f"{NETWORK}/network-security-groups/create-or-update"),
-        call("DELETE", RG + "/providers/Microsoft.Network/networkSecurityGroups/{networkSecurityGroupName}",
-             "Network Security Groups - Delete", "Network security groups", "", f"{NETWORK}/network-security-groups/delete"),
+        call("DELETE", NSG, "Network Security Groups - Delete", "Network security groups", "",
+             f"{NETWORK}/network-security-groups/delete"),
         call("GET", RG + "/providers/Microsoft.Network/networkSecurityGroups/{networkSecurityGroupName}/securityRules",
              "Security Rules - List", "Security rules", "", f"{NETWORK}/security-rules/list"),
         call("PUT", RG + "/providers/Microsoft.Resources/deployments/{deploymentName}", "Deployments - Create Or Update: "

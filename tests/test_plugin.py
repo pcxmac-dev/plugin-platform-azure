@@ -10,7 +10,7 @@ import time
 import pytest
 
 import plugin_platform_azure.__main__ as cli
-from conftest import CLIENT, HOME, SECRET, SUB, TENANT, FakeAzure, Pairs, settings_of
+from conftest import CLIENT, HOME, SECRET, SUB, TENANT, FakeAzure, Pairs, Platform, settings_of
 from plugin_platform_azure import NOT_SET, RETRY_S
 from plugin_platform_azure.page import BILLING
 from plugin_platform_azure.settings import read
@@ -46,7 +46,7 @@ def test_the_settings_are_read_through_the_login_by_their_pairs():
     login = Pairs(settings_of(ddns=True, AZURE_DDNS_MINUTES="15"))
     c = read(login)
     assert (c.tenant, c.client_id, c.client_secret, c.subscription, c.minutes, c.hosts) == \
-        (TENANT, CLIENT, SECRET, SUB, 15.0, ("home.example.com",))
+        (TENANT, CLIENT, SECRET, SUB, 15.0, ("new.example.com",))
     assert c.api_ready and c.ddns_ready and c.problems == ()
     assert "azure-client-secret" in login.asked and "AZURE_CLIENT_SECRET" not in login.asked  # asked by the pairs' names
     assert SECRET not in repr(c) and TENANT not in repr(c) and SUB not in repr(c)
@@ -116,7 +116,9 @@ def test_a_refresh_draws_the_tables_and_the_status_asks_nothing(made, env):
     assert t["Disks"]["rows"][0][:5] == [{"text": "old-data", "sub": "web-rg"}, "64", "Standard_LRS", "Unattached", "–"]
     assert t["Resource groups"]["rows"] == [["dns-rg", "westus2", "Succeeded", "1"], ["web-rg", "eastus", "Succeeded", "6"]]
     assert t["Other resources"]["rows"] == [["network interfaces", "2"], ["virtual networks", "1"], ["storage accounts", "1"]]
-    assert [a["hook"] for a in st["actions"]] == ["refresh", "ddns_update"] and all(a["args"] == [] for a in st["actions"])
+    assert st["actions"] == [{"hook": "refresh", "args": [], "title": "Refresh",
+                              "note": "the subscription read again now (a dozen requests or so)"},
+                             {"form": "ddns-now", "title": "Update DNS now"}]  # confirmed: a form, no longer one click
     text = json.dumps(st)
     for value in (SECRET, TENANT, CLIENT, SUB):
         assert value not in text  # the settings by name, never a value
@@ -192,13 +194,13 @@ def test_a_change_of_the_settings_makes_a_failed_read_untried_and_drops_what_was
 def test_attached_it_reads_in_the_background_through_the_apps_login_and_detached_nothing_runs(made):
     p, fake = made()
     login = Pairs(settings_of(ddns=True))
-    p.attach(object(), login)
+    p.attach(Platform(), login)
     try:
         assert p.working
         assert wait_until(lambda: p.status()["summary"] == f"2 VMs (1 running) · 1 DNS zone · 12.35 USD this month · "
-                                                          f"home.example.com at {HOME}")
+                                                          f"new.example.com at {HOME}")
         assert "azure-client-secret" in login.asked
-        assert fake.record("home", "A")["ARecords"] == [{"ipv4Address": HOME}]  # Dynamic DNS through Azure DNS
+        assert fake.record("new", "A")["ARecords"] == [{"ipv4Address": HOME}]  # Dynamic DNS through Azure DNS
     finally:
         p.detach()
     assert not p.working and p.login is None
@@ -212,13 +214,83 @@ def test_a_power_change_reads_the_states_again_soon(made, monkeypatch):
 
     monkeypatch.setattr(module, "SOON_S", 0.0)
     p, fake = made()
-    p.attach(object(), Pairs(settings_of()))
+    p.attach(Platform(), Pairs(settings_of()))
     try:
         assert wait_until(lambda: p.snapshot() is not None)
-        p.power("web-rg", "win1", "start")
+        p.power("web-rg", "win1", "start", accept_costs=True)
         assert wait_until(lambda: p.snapshot().vm("web-rg", "win1")["power"] == "running")
     finally:
         p.detach()
+
+
+def test_a_read_failing_for_a_passing_reason_leaves_it_valid_and_says_so(made, env):
+    """The audit: one failed read (a 503, a dropped connection) made the plugin not valid, the platform detached it, and
+    Dynamic DNS stopped until a page asked again. A passing failure leaves it valid, with the last read's tables, the
+    failure said as a problem, and is tried again soon; a refusal (a role missing) is still not valid."""
+    env(settings_of(ddns=True))
+    p, fake = made()
+    p.refresh()
+    for status, code in ((503, "ServiceUnavailable"), (500, "InternalServerError"), (429, "TooManyRequests")):
+        fake.fail["subscription"] = (status, code, "Azure is busy.")
+        with pytest.raises(Exception):
+            p.refresh()
+        st = p.status()
+        assert st["valid"] is True and "the last read failed" in st["problem"] and "tried again within minutes" in st["problem"]
+        assert "Virtual machines" in tables(st) and st["summary"].endswith("the last read failed: tried again soon")
+    fake.fail["subscription"] = (403, "AuthorizationFailed", "The client does not have authorization.")
+    with pytest.raises(Exception):
+        p.refresh()
+    st = p.status()
+    assert st["valid"] is False and "the service principal has no role" in st["why"]
+    fake.fail.clear()
+    p.refresh()
+    assert p.status()["valid"] is True and "problem" not in p.status()
+
+
+def test_a_connection_lost_on_the_first_read_is_tried_again_soon_in_the_background(made, monkeypatch):
+    import plugin_platform_azure as module
+
+    monkeypatch.setattr(module, "RETRY_SOON_S", 0.05)
+    p, fake = made()
+    real = fake.answer
+    lost = {"n": 4}  # more than the client's own two tries again: the first refresh fails, the worker's next one works
+
+    def drops(method, host, path, query, headers, data):
+        if host == "management.azure.com" and lost["n"] > 0 and path.endswith(SUB):
+            lost["n"] -= 1
+            raise ConnectionError("the connection was reset")
+        return real(method, host, path, query, headers, data)
+    fake.answer = drops
+    p.attach(Platform(), Pairs(settings_of()))
+    try:
+        assert wait_until(lambda: p.snapshot() is not None, 10.0)  # tried again by itself, still attached
+        assert p.status()["valid"] is True and lost["n"] == 0 and p.working
+        asked = [r for r in fake.requests if r["host"] == "management.azure.com" and r["path"].endswith(SUB)]
+        assert len(asked) == 5  # three tries of the first refresh dropped, then the worker's next refresh: one dropped, one answered
+    finally:
+        p.detach()
+
+
+def test_the_reading_starts_only_when_the_platform_attaches_it(made):
+    """The charts app run alone attaches every plugin it finds: by it, nothing of the plugin runs on its own."""
+    p, fake = made()
+
+    class Charts:
+        NAME = "charts"
+    for app in (object(), Charts()):
+        p.attach(app, Pairs(settings_of(ddns=True)))
+        try:
+            assert not p.working
+            time.sleep(0.1)
+            assert fake.requests == []
+        finally:
+            p.detach()
+    p.attach(Platform(), Pairs(settings_of()))
+    try:
+        assert p.working and wait_until(lambda: p.snapshot() is not None)
+    finally:
+        p.detach()
+    assert not p.working
 
 
 def test_the_hooks_are_asked_by_name_as_the_platform_asks_them(made, env):
@@ -258,10 +330,12 @@ def test_the_command_line(made, env):
     assert run("keys") == 0 and lines[0].startswith("laptop")
     assert run("groups") == 0 and run("disks") == 0 and run("ips") == 0
     assert run("cost") == 0 and lines == [lines[0]] and lines[0].startswith("12.35 USD this month so far")
-    assert run("ddns") == 0 and lines[0].startswith("home.example.com") and HOME in lines[0]
+    assert run("ddns") == 0 and lines[0].startswith("new.example.com") and HOME in lines[0]
     assert run("--json", "ddns", "--now") == 0 and json.loads("\n".join(lines))[0]["ok"] is True
     assert run("power", "win1", "on") == 1 and errors == ["nothing done"] and fake.vms["win1"]["power"] == "deallocated"
-    assert run("power", "win1", "on", say=["yes"]) == 0 and fake.vms["win1"]["power"] == "running"
+    assert run("power", "win1", "on", say=["yes"]) == 1 and fake.vms["win1"]["power"] == "deallocated"  # its charge: asked again
+    assert any("STARTS ITS COMPUTE CHARGE AGAIN" in x for x in lines)
+    assert run("power", "win1", "on", say=["yes", "yes"]) == 0 and fake.vms["win1"]["power"] == "running"
     assert run("power", "web1", "poweroff", say=["yes"]) == 1 and fake.vms["web1"]["power"] == "running"  # asked twice
     assert run("power", "web1", "poweroff", say=["yes", "yes"]) == 0 and fake.vms["web1"]["power"] == "stopped"
     assert any("STILL BILLED" in x for x in lines)
@@ -285,7 +359,9 @@ def test_the_platform_reads_it_in_its_own_shape(made, env):
     for t in st["tables"]:
         assert set(t) >= {"title", "columns", "rows"} and all(len(r) == len(t["columns"]) for r in t["rows"]), t["title"]
     hooks = p.interface()["hooks"]
-    assert all(a["hook"] in hooks for a in st["actions"]) and all(f["hook"] in hooks for f in st["forms"])
+    forms = {f["id"] for f in st["forms"]}
+    assert all(a["hook"] in hooks if "hook" in a else a["form"] in forms for a in st["actions"])
+    assert all(f["hook"] in hooks for f in st["forms"])
     flat = {k: v for k, v in st.items() if not isinstance(v, (list, dict))}
     assert all(isinstance(v, (str, bool)) for v in flat.values())
 

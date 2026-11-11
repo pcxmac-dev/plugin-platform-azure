@@ -34,7 +34,8 @@ Only what costs nothing, each through a form on the platform's page that names t
 
 | Change | Asked | What it does to the bill |
 |---|---|---|
-| **Start** a VM | once | a deallocated VM's compute charge starts again; a stopped (powered-off) one was billing all along (its confirmation says which, from its state as read) |
+| **Start** a deallocated VM | **twice** | its compute charge starts again (said, with its price, from its state read just before) |
+| **Start** a stopped (powered-off) VM | once | none: it was billing all along |
 | **Restart** a VM | once | none: it stays allocated and billed |
 | **Deallocate** a VM | once | its compute is no longer billed (a dynamic public IP is released; the temporary disk's data may be lost) |
 | **Power off** a VM | **twice** | none: it is still billed, as if it ran (said, and asked again) |
@@ -43,17 +44,27 @@ Only what costs nothing, each through a form on the platform's page that names t
 | **Add a security rule** | once; **twice** when risky | none |
 | **Remove a security rule** | once; **twice** when risky | none |
 | **Add / remove an SSH public key** | once | none (a key resource is free) |
+| **Take over** a Dynamic DNS host | once | none: its A record pointed at this network from then on |
+| **Update DNS now** | once | none |
 
-A risky rule is one that opens SSH (22), RDP (3389) or every port to the whole internet (`*`, `Internet`, `0.0.0.0/0`,
-`::/0`), an inbound Deny covering SSH or RDP on a group attached to a VM, or the removal of the inbound Allow rule that
-lets SSH or RDP in to a VM the group is attached to. The hook refuses it naming `accept_risky`, and the page asks a
-second, explicit confirmation before it sends it. Power off is refused the same way, naming `accept_still_billed`.
+A risky rule is one that opens every port, or a service no one should reach from everywhere (SSH, RDP, Telnet, SMB,
+Windows RPC, NetBIOS, SQL Server, Oracle, MySQL, PostgreSQL, Redis, MongoDB, Elasticsearch, Memcached, VNC, WinRM,
+Docker's API), to the whole internet (`*`, `Internet`, `0.0.0.0/0`, `::/0`); an inbound Deny covering SSH or RDP on a
+group attached to a VM; the removal of the inbound Allow rule that lets SSH or RDP in to a VM the group is attached to;
+or the removal of an inbound Deny that keeps a later rule from opening one of those to the whole internet. A rule's
+Source must be named: an empty one is refused, never taken as everywhere. The hook refuses a risky change naming
+`accept_risky`, and the page asks a second, explicit confirmation before it sends it. Power off is refused the same
+way, naming `accept_still_billed`, and the start of a deallocated VM naming `accept_costs`. A second confirmation counts
+only when it is exactly true (the page sends JSON `true`): a `"false"`, `"yes"` or `1` from a program on this PC is
+refused like none.
 
 How each change is made, as Azure's references give it:
 
 - **A VM's power**: `POST .../virtualMachines/{vm}/start | restart | deallocate | powerOff` (api-version 2026-04-01),
-  accepted by Azure (202) and done after; the VMs' states are read again about a minute later. Power off is graceful
-  (`skipShutdown` is never sent): no hard power-off is offered.
+  accepted by Azure (202) and done after; the VMs' states are read again about a minute later. A start reads the VM's
+  instance view just before: deallocated (or its state unreadable, taken as deallocated), it is refused until its
+  charge is accepted; running, there is nothing to start. Power off is graceful (`skipShutdown` is never sent): no hard
+  power-off is offered.
 - **A record**: Azure DNS writes a record set (every record of one name and type) whole. The record set is read just
   before, changed (an A, AAAA, CNAME or PTR record replaces the name's records of its type; an MX, TXT, NS, SRV or CAA
   record is added beside the others), and written back with `If-Match` its etag (a new one with `If-None-Match: *`), so a
@@ -61,11 +72,16 @@ How each change is made, as Azure's references give it:
   zone is left as it is. Removing the last record of a set deletes the set (`If-Match` too). Refused before anything is
   sent: the zone's own SOA and apex NS records, an alias record set (changed in the portal), a CNAME beside other records
   or at the apex.
-- **A security rule**: `PUT` or `DELETE .../networkSecurityGroups/{nsg}/securityRules/{rule}` (api-version 2026-01-01);
-  the group's other rules are never touched. A new rule needs a name of its own and a priority (100 to 4096) no rule of
-  its direction holds; the default rules cannot be removed.
-- **An SSH public key**: `PUT` or `DELETE .../sshPublicKeys/{name}`: RSA of 2048 bits or more, or ED25519, the one line
-  of a `.pub` file, stored in a resource group (in its location unless one is named).
+- **A security rule**: the group read just before (`GET .../networkSecurityGroups/{nsg}`), then `PUT` or `DELETE
+  .../networkSecurityGroups/{nsg}/securityRules/{rule}` (api-version 2026-01-01); the group's other rules are never
+  touched. A new rule needs a name of its own (one made in the portal since the last read too) and a priority (100 to
+  4096) no rule of its direction holds, and its `PUT` carries `If-None-Match: *`: no rule is ever replaced. The default
+  rules cannot be removed. (The reference lists no conditional header for this `PUT`; the read just before is what
+  refuses, and `If-None-Match` closes the moment between where the provider honours it.)
+- **An SSH public key**: looked for just before (`GET .../sshPublicKeys/{name}`), then `PUT` (with `If-None-Match: *`)
+  or `DELETE .../sshPublicKeys/{name}`: RSA of 2048 bits or more, or ED25519, the one line of a `.pub` file, stored in a
+  resource group (in its location unless one is named). A private key pasted there is refused before anything is sent,
+  without a word of it said back. With the key list not read, no key is offered to add.
 
 ## What it never does
 
@@ -151,31 +167,46 @@ are taken out of every message); its status names the settings that are set.
 ## Dynamic DNS
 
 Each host in `AZURE_DDNS_HOSTS` that is in one of the subscription's Azure DNS zones is kept at this network's public
-IPv4 address (the library's `machines.ddns.Keeper`): the address is asked of OpenDNS's resolver
-(`myip.opendns.com`), else Google's (`o-o.myaddr.l.google.com`), each by its own address; each host's A record set is
-read and written only when it differs (Update DNS now writes every host), with its etag, its TTL and metadata kept (a
-new one made with a TTL of 300 seconds). An alias record set, or a name that is a CNAME, is not written: its row says
-why. A host in no zone of the subscription is said in the plugin's problem.
+IPv4 address (the library's `machines.ddns.Keeper`), but only when its record is Dynamic DNS's own: a host with no A
+record (made, with a TTL of 300 seconds), one already pointing here or at the address it set last, or one you took over.
+Any other record (another address, or several) is left as it is, its row saying what it holds and offering **Take
+over…**: once confirmed (its words name what the record holds and that it will point here), the host's A record is set
+to this network's address alone and kept there. Several addresses are never cut to one unasked. What is its own is kept
+in the platform's folder (`LIMINAL_PLATFORM_DIR`, else the data folder's `platform/`), under `azure/ddns.json`.
+
+This network's address is asked of OpenDNS's resolver (`myip.opendns.com`), else Google's (`o-o.myaddr.l.google.com`),
+each by its own address, and asked again just before a write (nothing is written if it changed meanwhile). Each host's
+A record set is written with its etag, its TTL and metadata kept. **Update DNS now** (confirmed) writes every host of its
+own. A host taken out of the settings is let go; a host whose A record you set by hand on the page is let go too (left as
+you set it, until you take it over again). An alias record set, a name that is a CNAME, or a zone name two resource
+groups hold, is not written: its row says why. A host in no zone of the subscription is said in the plugin's problem,
+and with no host in any zone, not even this network's address is asked.
 
 ## Valid, and the platform
 
-The plugin is valid while its four credentials are set and the last read worked or has not been tried yet; the
-platform disables a plugin that is not valid. A read that failed is taken as untried a quarter of an hour later (the
-platform attaches it again and it is tried again), or at once when its settings change. A part of the subscription that
-cannot be read (a role without one provider's read, a provider the subscription is not registered for) is said under
-its table, and the rest is shown. While attached, it reads the subscription every quarter of an hour (about a dozen
-requests, the record sets of at most 12 zones, the price of a VM size once a day, the cost every six hours) and checks
-the Dynamic DNS hosts every `AZURE_DDNS_MINUTES`, in a thread of its own; detached, nothing of it runs.
+The plugin is valid while its four credentials are set and the last read worked, has not been tried yet, or failed for
+a passing reason (no connection, Azure answering 5xx or 429): then its last tables stay, the failure is said as its
+problem, and the read is tried again after a minute, then twice as long each time, so the platform keeps it attached and
+Dynamic DNS goes on. A refusal (the credentials, a role, a subscription not found) makes it not valid, and the platform
+disables it; such a read is taken as untried a quarter of an hour later (the platform attaches it again and it is tried
+again), or at once when its settings change. A part of the subscription that cannot be read (a role without one
+provider's read, an API version Resource Manager does not serve) is said under its table, and the rest is shown; a
+provider the subscription is not registered for reads as none.
+
+Attached by the platform, it reads the subscription every quarter of an hour (about a dozen requests, the record sets of
+at most 12 zones, the price of a VM size once a day, the cost every six hours) and checks the Dynamic DNS hosts every
+`AZURE_DDNS_MINUTES`, in a thread of its own. Attached by any other app (the charts app run alone attaches every plugin
+it finds), nothing of it runs on its own. Detached, nothing of it runs, and a pass under way writes nothing more.
 
 ## Its hooks
 
 `present`, `status` (the summary, the facts, `tables`, `actions`, `forms`), `refresh()`, `vms()`, `zones()`,
-`records(zone, group=None)`, `nsgs()`, `ssh_keys()`, `power(group, name, action, accept_still_billed=False)` (action:
-start, restart, deallocate, poweroff), `set_record(group, zone, name, rtype, value, ttl=None)`,
+`records(zone, group=None)`, `nsgs()`, `ssh_keys()`, `power(group, name, action, accept_still_billed=False,
+accept_costs=False)` (action: start, restart, deallocate, poweroff), `set_record(group, zone, name, rtype, value, ttl=None)`,
 `remove_record(group, zone, name, rtype, value="")`, `add_rule(group, nsg, name, direction, access, protocol, ports,
 source=None, destination=None, priority=None, description=None, accept_risky=False)`, `remove_rule(group, nsg, name,
 accept_risky=False)`, `add_ssh_key(group, name, public_key, location=None)`, `remove_ssh_key(group, name)`,
-`ddns_update(force=True)`. A change's answer: `said`, `lines`, `ok`.
+`ddns_update(force=True)`, `ddns_take_over(host, holds=None)`. A change's answer: `said`, `lines`, `ok`.
 
 ## From the command line
 
@@ -194,7 +225,8 @@ python -m plugin_platform_azure set example.com home A 203.0.113.7 --ttl 300
 python -m plugin_platform_azure remove example.com home A 203.0.113.7
 ```
 
-Each change asks you to type `yes` first (power off twice). `--json` before the command prints the answer as JSON;
+Each change asks you to type `yes` first (twice: a power off, and the start of a deallocated VM). `--json` before the
+command prints the answer as JSON;
 `--group` names the resource group when a VM or a zone's name is in more than one.
 
 ## Its API

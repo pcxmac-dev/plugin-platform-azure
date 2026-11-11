@@ -354,12 +354,17 @@ def _strings(blob: bytes) -> list[bytes]:
 def check_key(text: str) -> tuple[str, str]:
     """An SSH public key Azure takes (RSA of 2048 bits or more, or ED25519), as the one line sent, and its description;
     ValueError in words otherwise."""
-    line = " ".join(str(text or "").split())
-    if any(ord(c) < 32 for c in str(text or "").strip()):
+    raw = str(text or "")
+    if "PRIVATE KEY" in raw.upper():  # a private key pasted: refused without a word of it said back
+        raise ValueError("that is a private key: paste the one line of the .pub file beside it (ssh-ed25519 AAAA… or "
+                         "ssh-rsa AAAA…); a private key never leaves this PC")
+    line = " ".join(raw.split())
+    if any(ord(c) < 32 for c in raw.strip()):
         raise ValueError("an SSH public key is one line")
     kind, blob, _ = key_blob(line)
     if kind not in KEY_TYPES:
-        raise ValueError(f"{kind!r} keys are not taken by Azure: RSA (ssh-rsa, 2048 bits or more) or ED25519 (ssh-ed25519)")
+        named = kind if re.fullmatch(r"(?:ssh|ecdsa|sk)-[a-z0-9@.-]{1,40}", kind) else "that"  # a key type, never what was pasted
+        raise ValueError(f"{named} keys are not taken by Azure: RSA (ssh-rsa, 2048 bits or more) or ED25519 (ssh-ed25519)")
     parts = _strings(blob)
     if not parts or parts[0].decode("ascii", "replace") != kind:
         raise ValueError(f"not an SSH public key: its blob is not an {kind} key's")

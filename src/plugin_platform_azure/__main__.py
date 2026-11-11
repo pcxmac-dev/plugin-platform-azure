@@ -8,9 +8,11 @@ EnvironmentLogin: the variables as this shell has them).
     domains                                  the Azure DNS zones
     records ZONE [--group G]                 a zone's record sets
     keys                                     the SSH public keys stored in Azure
-    ddns [--now]                             a Dynamic DNS pass: a record set written where a host differs (--now: every host)
+    ddns [--now]                             a Dynamic DNS pass: a host of its own written where it differs (--now: every
+                                             one of its own); a host holding another address left as it is
     power NAME start|restart|deallocate|poweroff [--group G]
-                                             a VM's power changed, once you type yes (power off: twice, as it still bills)
+                                             a VM's power changed, once you type yes (twice: a power off, which still bills,
+                                             and a start that starts the compute charge again, its state read just before)
     set ZONE NAME TYPE VALUE [--ttl N] [--group G]
                                              a record set, every other record kept, once you type yes
     remove ZONE NAME TYPE VALUE [--group G]  a record removed, the rest kept, once you type yes
@@ -26,7 +28,8 @@ from liminal_libs.machines.rest import RestError
 
 from . import MACHINE, page
 from . import rules as nsg_rules
-from .page import BILLING, when
+from .page import ACCEPT_BILLED, ACCEPT_COSTS, BILLING, when
+from .records import Refusal
 
 ALIASES = {"on": "start", "reboot": "restart", "off": "deallocate", "stop": "deallocate", "power-off": "poweroff",
            "poweroff": "poweroff", "start": "start", "restart": "restart", "deallocate": "deallocate"}
@@ -164,13 +167,18 @@ def main(argv: list[str] | None = None, plugin=None, out=None, err=None, ask=Non
             if not confirmed(ask, say, words):
                 tell("nothing done")
                 return 1
-            accept = False
-            if action == "poweroff":
-                if not confirmed(ask, say, "Powered off, it still bills; deallocate stops that charge. Power it off anyway?"):
-                    tell("nothing done")
-                    return 1
-                accept = True
-            answer = p.power(v["group"], v["name"], action, accept_still_billed=accept)
+            accepts: dict = {}
+            while True:  # a refusal naming its accept (power off still bills; a start that starts a charge) asked again
+                try:
+                    answer = p.power(v["group"], v["name"], action, **accepts)
+                    break
+                except Refusal as e:
+                    if e.accept not in (ACCEPT_BILLED, ACCEPT_COSTS) or e.accept in accepts:
+                        raise
+                    if not confirmed(ask, say, f"{e}. Go on anyway?"):
+                        tell("nothing done")
+                        return 1
+                    accepts[e.accept] = True
             lines = [answer["said"], *(f"  {x}" for x in answer["lines"])]
         else:  # set, remove
             z = p._zone(args.zone, args.group)

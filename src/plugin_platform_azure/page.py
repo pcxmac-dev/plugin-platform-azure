@@ -11,6 +11,7 @@ from .api import HOURS_A_MONTH
 from .model import POWER, SHOWN, Snapshot, kind_of, zone_key
 
 ACCEPT_BILLED = "accept_still_billed"  # power off: the VM still bills, accepted on a second confirmation
+ACCEPT_COSTS = "accept_costs"  # a start that starts the compute charge again (a deallocated VM), accepted the same way
 ACCEPT_RISKY = nsg_rules.ACCEPT
 BILLING = ("A VM stopped with Power off, or shut down from inside its OS, is still billed for its compute (Azure: Stopped); "
            "one deallocated is not, though its disks and static public IPs still bill.")
@@ -53,10 +54,12 @@ def start_form(power: str) -> str:
 
 
 def start_words(power: str) -> str:
-    """What starting a VM in this power state does to the bill, in words."""
+    """What starting a VM in this power state (read just before) does to the bill, in words."""
     if power in DEALLOCATED:
         return "it was deallocated: starting it starts its compute charge again, by the hour"
-    return "it was stopped but still allocated: it has been billed for its compute all along, so the bill does not change"
+    if power == "stopped":
+        return "it was stopped but still allocated: it has been billed for its compute all along, so the bill does not change"
+    return "its power state could not be read just before: its compute is billed from when it runs"
 
 
 def price_cells(price: dict | None, why: str = "") -> object:
@@ -235,19 +238,27 @@ def others_table(snap: Snapshot) -> dict:
 
 # -- the forms --------------------------------------------------------------------------------------------------------------
 def vm_forms() -> list:
-    """The power changes, each a form over the hook `power` (group, name, action, accept_still_billed), its confirmation
-    saying what it bills: two Start forms, the row's button naming the one for its VM's power state as read (a deallocated
-    VM's compute charge starts again; a stopped one was billing all along), each asked once."""
+    """The power changes, each a form over the hook `power` (group, name, action, accept_still_billed, accept_costs), its
+    confirmation saying what it bills: two Start forms, the row's button naming the one for its VM's power state as last
+    read (a deallocated VM's compute charge starts again; a stopped one was billing all along). The hook reads the VM's
+    state again just before a start and refuses one that starts a charge until that is accepted (accept_costs: the second
+    confirmation, with what it costs), as it refuses a power off until its still billing is (accept_still_billed)."""
     fixed = [{"name": "group", "label": "Resource group", "type": "fixed"}, {"name": "name", "label": "VM", "type": "fixed"}]
-    accept = {"name": ACCEPT_BILLED, "type": "accept", "title": "Power it off anyway?", "yes": "Power off anyway",
+    billed = {"name": ACCEPT_BILLED, "type": "accept", "title": "Power it off anyway?", "yes": "Power off anyway",
               "words": ("Powered off, {name} keeps its place on its host and is billed for its compute by the hour, as when "
                         "it runs. Deallocate is what stops that charge.")}
+    costs = {"name": ACCEPT_COSTS, "type": "accept", "title": "Start its compute charge again?", "yes": "Start it, and its charge",
+             "words": ("Started, {name} is billed for its compute by the hour from when it runs, at its size's price (in the "
+                       "table), until it is deallocated again.")}
     words = {
-        "start-deallocated": ("Start this VM?", "{name} in {group} is deallocated, so its compute is not billed now. "
-                              "Starting it STARTS ITS COMPUTE CHARGE AGAIN, by the hour (its price is in the table), and a "
-                              "dynamic public IP may come back as another address.", "Start it", False),
-        "start-stopped": ("Start this VM?", "{name} in {group} is stopped (powered off) but still allocated: it has been "
-                          "billed for its compute all along, so starting it adds no charge.", "Start it", False),
+        "start-deallocated": ("Start this VM?", "{name} in {group} is deallocated (as last read), so its compute is not "
+                              "billed now. Starting it STARTS ITS COMPUTE CHARGE AGAIN, by the hour (its price is in the "
+                              "table), and a dynamic public IP may come back as another address. Its state is read again "
+                              "first, and you are asked once more.", "Go on", False),
+        "start-stopped": ("Start this VM?", "{name} in {group} is stopped (powered off, as last read) but still allocated: "
+                          "it has been billed for its compute all along, so starting it adds no charge. Its state is read "
+                          "again first: if it is deallocated by now, you are asked once more, as starting it would start "
+                          "its compute charge again.", "Start it", False),
         "restart": ("Restart this VM?", "{name} in {group} is restarted: its operating system restarts, and what is not "
                     "saved is lost. It stays allocated and billed.", "Restart it", True),
         "deallocate": ("Deallocate this VM?", "{name} in {group} is shut down and its compute released: its compute is no "
@@ -260,7 +271,7 @@ def vm_forms() -> list:
     out = []
     for form, (head, text, yes, danger) in words.items():
         action = form.split("-", 1)[0]
-        fields = [*fixed, {"name": "action", "label": "Change", "type": "fixed", "value": action}, accept]
+        fields = [*fixed, {"name": "action", "label": "Change", "type": "fixed", "value": action}, billed, costs]
         out.append({"id": f"vm:{form}", "hook": "power", "title": f"{ACTIONS[action][0]} a VM", "fields": fields,
                     "confirm": {"title": head, "words": text, "yes": yes, "danger": danger}})
     return out
@@ -275,7 +286,8 @@ def record_forms(z: dict) -> list:
     return [
         {"id": f"record-set:{g}/{name}", "hook": "set_record", "title": f"Set a record in {name}",
          "note": ("An A, AAAA, CNAME or PTR record replaces the name's records of its type; an MX, TXT, NS, SRV or CAA record "
-                  "is added beside the others."),
+                  "is added beside the others. A Dynamic DNS host's A record set here by hand is left as you set it: "
+                  "Dynamic DNS lets it go until you take it over again."),
          "fields": [*fixed,
                     {"name": "name", "label": "Name", "type": "text", "required": True, "placeholder": "@, www, home",
                      "note": f"@ is {name} itself; home is home.{name}"},
@@ -308,9 +320,10 @@ def rule_forms(g: dict) -> list:
     servers = ", ".join(g["servers"]) or "no VM"
     return [
         {"id": f"rule-add:{rg}/{nsg}", "hook": "add_rule", "title": f"Add a rule to {nsg}",
-         "note": (f"{nsg} is attached to {servers}. The rule gets a name of its own; one of that name, or a priority "
-                  "another rule of its direction holds, is refused. A rule opening SSH, RDP or every port to the whole "
-                  "internet, or denying SSH or RDP to a VM, is asked twice."),
+         "note": (f"{nsg} is attached to {servers}. The group is read again first: a rule of that name, or a priority "
+                  "another rule of its direction holds, is refused, and none is ever replaced. A rule opening every port, "
+                  "or SSH, RDP, a database, Docker's API or WinRM, to the whole internet, or denying SSH or RDP to a VM, "
+                  "is asked twice."),
          "fields": [*fixed,
                     {"name": "name", "label": "Rule name", "type": "text", "required": True, "placeholder": "allow-ssh-home"},
                     {"name": "direction", "label": "Direction", "type": "choice", "value": "Inbound",
@@ -321,8 +334,8 @@ def rule_forms(g: dict) -> list:
                      "choices": [{"value": p, "title": "any" if p == "*" else p} for p in nsg_rules.PROTOCOLS]},
                     {"name": "ports", "label": "Destination ports", "type": "text", "required": True,
                      "placeholder": "22, 80, 443, 8000-8100 or *"},
-                    {"name": "source", "label": "Source", "type": "text", "placeholder": "your address, a CIDR, Internet or *",
-                     "empty": "* (any source)"},
+                    {"name": "source", "label": "Source", "type": "text", "required": True,
+                     "placeholder": "your address, a CIDR, a service tag, or * (Internet) for everywhere"},
                     {"name": "destination", "label": "Destination", "type": "text", "placeholder": "* or a CIDR",
                      "empty": "* (any destination)"},
                     {"name": "priority", "label": "Priority", "type": "number", "min": nsg_rules.PRIORITY[0],
@@ -347,7 +360,8 @@ def key_forms(groups: list) -> list:
     return [
         {"id": "key-add", "hook": "add_ssh_key", "title": "Add an SSH public key",
          "note": ("Stored in Azure as a resource of its own (it costs nothing), to be offered when a VM is made: RSA of 2048 "
-                  "bits or more, or ED25519, the one line of its .pub file."),
+                  "bits or more, or ED25519, the one line of its .pub file (never the private key beside it). A key of "
+                  "that name in the group, made since the last read too, is refused: none is ever replaced."),
          "fields": [{"name": "group", "label": "Resource group", "type": "choice",
                      "choices": [{"value": g["name"], "title": g["name"], "note": g["location"]} for g in groups]},
                     {"name": "name", "label": "Name", "type": "text", "required": True, "placeholder": "my-laptop"},

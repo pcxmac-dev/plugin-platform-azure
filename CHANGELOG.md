@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.1.1 (2026-11-11)
+
+What the audit of the six cloud plugins found before any key went in (session 87405e6a: eight reviewers, a skeptic per
+finding; every serious finding confirmed), fixed. Needs liminal-libs 1.49.2.
+
+- **Dynamic DNS changes only what is its own** (the library's Keeper): a host with no A record (made), one pointing here
+  or at the address it set last, or one you took over. Any other record (another address, or several) is left as it is
+  and said so, its row offering **Take over…** (a confirmed form, `ddns_take_over`, then a pass for that host); several
+  addresses are never cut to one. What is its own is kept in the platform's folder (`azure/ddns.json`), so a restart after
+  the network's address changed still knows its record. **Update DNS now** is a confirmed form. A host taken out of the
+  settings is let go; one whose A record you set by hand on the page is let go too (left as you set it). A zone name two
+  resource groups hold is written in neither; with no host in the subscription's zones, not even this network's address
+  is asked.
+- **Starting a deallocated VM is asked twice** (`accept_costs`), the refusal saying which charge resumes and at what
+  price; the VM's state is read just before the start (its instance view), not taken from a read up to a quarter hour
+  old; a stopped one, billing all along, stays asked once.
+- **A rule or an SSH key is never replaced**: the group (or the key) is read just before, one of that name is refused,
+  and the PUT is sent with `If-None-Match: *`. With the key list not read, no key is offered to add. A rule's Source must
+  be named (an empty one was the whole internet); an Allow opening a database, Docker's API, WinRM, SMB, Telnet, VNC
+  (or SSH, RDP, every port) to the whole internet is asked twice, and so is removing a Deny that keeps a later rule from
+  opening one.
+- **A read failing for a passing reason** (no connection, a 5xx, a 429) leaves the plugin valid, its last tables shown and
+  the failure said, and is tried again after a minute, then twice as long each time: the platform no longer detaches it,
+  so Dynamic DNS goes on. A refusal (a role missing, the credentials) is still not valid.
+- **The background reading starts only when the platform attaches it**: the charts app run alone attaches every plugin it
+  finds, and nothing of this one runs then. A pass ends once the plugin is detached (nothing more written) and reads no
+  settings while it runs.
+- **A second confirmation counts only when exactly true** (`accept_still_billed`, `accept_costs`, `accept_risky`): a
+  "false", "yes" or 1 from a program on this PC is refused like none.
+- A private key pasted as a public key is refused without a word of it said back (the platform logs no hook's values
+  since 0.20.1); a secret pasted into the Dynamic DNS hosts is taken out of the page; a Resource Manager answer naming an
+  API version it does not serve (NoRegisteredProviderFound) is said under its table, never shown as "nothing there"; a
+  price list's next page on its own host followed.
+- The card: Network Security Groups - Get and SSH Public Keys - Get (read just before a change), the start call's
+  words.
+
 ## 0.1.0 (2026-11-11)
 
 The first release (the user: "lets roll plugins for EC2, vultr, azure and google cloud"; for the cloud plugins, "Free

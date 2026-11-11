@@ -7,9 +7,11 @@ range, or *). A rule is added with a PUT of its own and removed with a DELETE of
 touched. The default rules (AllowVnetInBound ... DenyAllInBound) are the group's own and cannot be removed.
 
 A change that may lock this PC out of a server, or open one to the whole internet, is risky: asked a second time
-(`risk_of_adding`, `risk_of_removing`): an Allow inbound rule opening SSH (22), RDP (3389) or every port to any source; an
-inbound Deny covering SSH or RDP on a group attached to a server; the removal of an inbound Allow rule letting SSH or RDP
-in to a server the group is attached to."""
+(`risk_of_adding`, `risk_of_removing`): an Allow inbound rule opening a service that is no one's to reach from everywhere
+(RISKY: SSH, RDP, Telnet, SMB, the databases, Docker's API, WinRM ...) or every port to the whole internet; an inbound
+Deny covering SSH or RDP on a group attached to a server; the removal of an inbound Allow rule letting SSH or RDP in to a
+server the group is attached to, and of an inbound Deny that keeps a later Allow from opening one of RISKY to the whole
+internet. A rule's source is always named (* or Internet for everywhere): an empty one is refused, never taken as *."""
 from __future__ import annotations
 
 import ipaddress
@@ -21,6 +23,11 @@ ACCESSES = ("Allow", "Deny")
 PROTOCOLS = ("Tcp", "Udp", "Icmp", "Esp", "Ah", "*")  # SecurityRuleProtocol
 PRIORITY = (100, 4096)
 SSH, RDP = 22, 3389
+# the services opened to the whole internet only on purpose: an Allow from everywhere covering one is asked twice
+RISKY = {22: "SSH", 3389: "RDP", 23: "Telnet", 135: "Windows RPC", 139: "NetBIOS", 445: "SMB", 1433: "SQL Server",
+         1521: "Oracle", 2375: "Docker's API", 2376: "Docker's API (TLS)", 3306: "MySQL", 5432: "PostgreSQL",
+         5900: "VNC", 5985: "WinRM", 5986: "WinRM (HTTPS)", 6379: "Redis", 9200: "Elasticsearch", 11211: "Memcached",
+         27017: "MongoDB"}
 WIDE = frozenset({"*", "internet", "0.0.0.0/0", "::/0"})  # a source that is the whole internet
 NAME = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,78}[A-Za-z0-9_])?$")
 TAG = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:\.[A-Za-z0-9]+)*$")  # a service tag: Internet, VirtualNetwork, Storage.WestUS
@@ -122,17 +129,25 @@ def lets_in(rule: Rule) -> list[str]:
     return [w for w, p in (("SSH (port 22)", SSH), ("RDP (port 3389)", RDP)) if covers_port(rule, p)]
 
 
+def opens(rule: Rule) -> list[str]:
+    """The services of RISKY an inbound Allow rule from the whole internet opens, in words ([] for any other rule)."""
+    if rule.direction != "Inbound" or rule.access != "Allow" or not from_everywhere(rule):
+        return []
+    return [f"{what} (port {port})" for port, what in sorted(RISKY.items()) if covers_port(rule, port)]
+
+
 def risk_of_adding(rule: Rule, servers: list[str]) -> str:
-    """Why adding `rule` is risky, in words ("" when it is not): an Allow inbound rule opening SSH, RDP or every port to
-    the whole internet; an inbound Deny covering SSH or RDP on a group attached to `servers` (it may cut this PC off)."""
+    """Why adding `rule` is risky, in words ("" when it is not): an Allow inbound rule opening every port, or a service of
+    RISKY, to the whole internet; an inbound Deny covering SSH or RDP on a group attached to `servers` (it may cut this
+    PC off)."""
     if rule.direction != "Inbound":
         return ""
     if rule.access == "Allow" and from_everywhere(rule):
-        opened = [w for w, p in (("SSH (port 22)", SSH), ("RDP (port 3389)", RDP)) if covers_port(rule, p)]
         if every_port(rule) and rule.protocol in ("Tcp", "Udp", "*"):
             return "it opens every port to the whole internet"
+        opened = opens(rule)
         if opened:
-            return f"it opens {' and '.join(opened)} to the whole internet"
+            return f"it opens {_and(opened)} to the whole internet"
         return ""
     if rule.access == "Deny" and servers:
         cut = [w for w, p in (("SSH (port 22)", SSH), ("RDP (port 3389)", RDP)) if covers_port(rule, p)]
@@ -142,12 +157,27 @@ def risk_of_adding(rule: Rule, servers: list[str]) -> str:
     return ""
 
 
-def risk_of_removing(rule: Rule, servers: list[str]) -> str:
-    """Why removing `rule` is risky ("" when it is not): it is the inbound Allow letting SSH or RDP in to `servers`."""
+def risk_of_removing(rule: Rule, servers: list[str], others: list | None = None) -> str:
+    """Why removing `rule` is risky ("" when it is not): it is the inbound Allow letting SSH or RDP in to `servers`; or an
+    inbound Deny ahead of an Allow (among `others`, the group's other rules) that would then open a service of RISKY, or
+    every port, to the whole internet."""
     let = lets_in(rule)
     if let and servers:
         return f"it is the rule letting {' and '.join(let)} in to {', '.join(servers)}: without it, they may be cut off"
+    if rule.direction == "Inbound" and rule.access == "Deny":
+        later = [r for r in others or [] if r.priority > rule.priority and r.name != rule.name]
+        freed = [w for port, what in sorted(RISKY.items()) if covers_port(rule, port)
+                 for w in [f"{what} (port {port})"] if any(w in opens(r) for r in later)]
+        if freed:
+            return f"without it, a later rule opens {_and(freed)} to the whole internet"
+        if every_port(rule) and any(every_port(r) and r.direction == "Inbound" and r.access == "Allow" and from_everywhere(r)
+                                    for r in later):
+            return "without it, a later rule opens every port to the whole internet"
     return ""
+
+
+def _and(items: list[str]) -> str:
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " and " + items[-1]
 
 
 # -- a rule as typed ---------------------------------------------------------------------------------------------------------
@@ -180,11 +210,14 @@ def ports_of(value) -> list[str]:
     return out
 
 
-def addresses_of(value, what: str) -> list[str]:
+def addresses_of(value, what: str, required: bool = False) -> list[str]:
     """Sources or destinations as typed: * (any), a service tag (Internet, VirtualNetwork, AzureLoadBalancer ...), or IP
-    addresses and CIDRs, comma separated (a tag stands alone)."""
+    addresses and CIDRs, comma separated (a tag stands alone). Left empty: * where it may be (a destination), refused where
+    it must be named (`required`: a source, so the whole internet is never opened by a field left empty)."""
     parts = [p.strip() for p in re.split(r"[,\s]+", str(value or "")) if p.strip()]
     if not parts:
+        if required:
+            raise ValueError(f"no {what} given: an address, a CIDR, a service tag, or * (or Internet) for everywhere")
         return ["*"]
     if len(parts) == 1 and (parts[0] == "*" or (TAG.match(parts[0]) and not _ip(parts[0]))):
         return parts
@@ -220,8 +253,8 @@ def rule_of(name, direction, access, protocol, ports, source, destination, prior
         raise ValueError(f"a description is one line of at most {DESCRIPTION_MAX} characters")
     return Rule(name=n, priority=p, direction=choice(direction, DIRECTIONS, "the direction"),
                 access=choice(access, ACCESSES, "the access"), protocol=choice(protocol, PROTOCOLS, "the protocol"),
-                ports=ports_of(ports), sources=addresses_of(source, "the source"),
-                destinations=addresses_of(destination, "the destination"), description=d, source_ports=["*"])
+                ports=ports_of(ports), sources=addresses_of(source, "source", required=True),
+                destinations=addresses_of(destination, "destination"), description=d, source_ports=["*"])
 
 
 def body(rule: Rule) -> dict:

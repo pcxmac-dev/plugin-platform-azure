@@ -1,16 +1,18 @@
 """The platform's page makes the free changes through the plugin's forms (liminal-platform draws status.forms): each form's
 fields are its hook's arguments in order, each change is confirmed by the user with the exact change named, and the hook
 sends exactly the request Azure's reference gives (method, path, api-version, headers, body). A powered-off VM still bills,
-so its form is refused once and sent only when the second confirmation accepts that; a risky security rule likewise. Over
-the stand-ins alone."""
+so its form is refused once and sent only when the second confirmation accepts that; a start that starts the compute
+charge again (a deallocated VM, its state read just before), and a risky security rule, likewise. A second confirmation
+counts only when exactly true. A rule or an SSH key is never replaced: the group or the key is read just before and the
+PUT sent with If-None-Match: *. Over the stand-ins alone."""
 from __future__ import annotations
 
 import inspect
 
 import pytest
 
-from conftest import SUB, FakeAzure, settings_of, ssh_key
-from plugin_platform_azure.page import ACCEPT_BILLED, ACCEPT_RISKY
+from conftest import SUB, FakeAzure, rule, settings_of, ssh_key
+from plugin_platform_azure.page import ACCEPT_BILLED, ACCEPT_COSTS, ACCEPT_RISKY
 from plugin_platform_azure.records import Refusal
 
 ARM = f"/subscriptions/{SUB}"
@@ -78,11 +80,12 @@ def test_every_form_is_its_hooks_arguments_in_order_and_confirmed(read):
 def test_the_power_forms_send_the_vm_actions_as_the_reference_gives_them(read):
     p, fake = read
     forms = forms_of(p)
-    for button, action, path in (("Restart web1", "restart", "restart"), ("Deallocate web1", "deallocate", "deallocate"),
-                                 ("Start win1", "start", "start")):
+    for button, action, path, accepted in (("Restart web1", "restart", "restart", ()),
+                                           ("Deallocate web1", "deallocate", "deallocate", ()),
+                                           ("Start win1", "start", "start", {ACCEPT_COSTS})):
         b = row_button(p, "Virtual machines", button)
         f = forms[b["form"]]
-        args = page_args(f, b["values"])
+        args = page_args(f, b["values"], accepted)
         assert args[:3] == ["web-rg", button.split()[1], action] and args[3] is False
         rep = p.ask(f["hook"], *args)
         assert rep["ok"] and rep["accepted"] is True
@@ -91,23 +94,65 @@ def test_the_power_forms_send_the_vm_actions_as_the_reference_gives_them(read):
         assert r["query"] == {"api-version": "2026-04-01"} and r["body"] is None
 
 
-def test_start_says_which_applies_to_that_vm_from_its_power_state(read):
-    """A deallocated VM's Start starts its compute charge again; a stopped (powered-off) VM was billing all along: the row's
-    Start opens the form that says which, from the state as read, and is asked once."""
+def test_starting_a_deallocated_vm_is_asked_twice_its_charge_said_from_its_state_read_just_before(read):
+    """The audit: a deallocated VM's Start resumed its compute charge on one confirmation, and its words came from a state
+    up to a quarter hour old. The hook reads the VM's state just before: a start that starts the charge again is refused
+    until accept_costs (its price said); a stopped one, billing all along, is asked once."""
     p, fake = read
     b = row_button(p, "Virtual machines", "Start win1")  # win1 deallocated
     f = forms_of(p)[b["form"]]
     assert b["form"] == "vm:start-deallocated" and "STARTS ITS COMPUTE CHARGE AGAIN" in f["confirm"]["words"]
-    rep = p.ask(f["hook"], *page_args(f, b["values"]))  # asked once: no second confirmation
-    assert rep["ok"] and "starts its compute charge again" in rep["lines"][0]
-    fake.vms["web1"]["power"] = "stopped"  # powered off, still allocated
+    calls = len(fake.requests)
+    with pytest.raises(Refusal, match="win1 is deallocated now \\(read just now\\): starting it STARTS ITS COMPUTE CHARGE AGAIN") as refused:
+        p.ask(f["hook"], *page_args(f, b["values"]))
+    assert refused.value.accept == ACCEPT_COSTS and "0.1880 USD an hour (about 137.24 USD a month" in str(refused.value)
+    assert [r["path"].rsplit("/", 1)[-1] for r in fake.requests[calls:]] == ["instanceView"] and fake.writes() == []
+    costs = next(x for x in f["fields"] if x["name"] == ACCEPT_COSTS)
+    assert costs["type"] == "accept" and "billed for its compute by the hour" in costs["words"]
+    rep = p.ask(f["hook"], *page_args(f, b["values"], accepted={ACCEPT_COSTS}))
+    assert rep["ok"] and "starts its compute charge again" in rep["lines"][0] and fake.vms["win1"]["power"] == "running"
+    # a stopped VM (powered off, still allocated) was billing all along: asked once
+    fake.vms["web1"]["power"] = "stopped"
     p.refresh()
     b = row_button(p, "Virtual machines", "Start web1")
     f = forms_of(p)[b["form"]]
     assert b["form"] == "vm:start-stopped" and "billed for its compute all along" in f["confirm"]["words"]
-    assert "CHARGE AGAIN" not in f["confirm"]["words"]
     rep = p.ask(f["hook"], *page_args(f, b["values"]))
     assert rep["ok"] and "billed for its compute all along" in rep["lines"][0] and fake.vms["web1"]["power"] == "running"
+    # read as stopped, deallocated in the portal since: the state read just before decides, and asks again
+    fake.vms["web1"]["power"] = "stopped"
+    p.refresh()
+    b = row_button(p, "Virtual machines", "Start web1")
+    fake.vms["web1"]["power"] = "deallocated"
+    f = forms_of(p)[b["form"]]
+    assert b["form"] == "vm:start-stopped"
+    with pytest.raises(Refusal, match="web1 is deallocated now") as refused:
+        p.ask(f["hook"], *page_args(f, b["values"]))
+    assert refused.value.accept == ACCEPT_COSTS and fake.vms["web1"]["power"] == "deallocated"
+    # a state that cannot be read is taken as the costly one; a running VM has nothing to start
+    fake.fail["view"] = (500, "InternalServerError", "busy")
+    with pytest.raises(Exception):
+        p.ask(f["hook"], *page_args(f, b["values"]))
+    fake.fail.clear()
+    fake.vms["web1"]["power"] = "running"
+    with pytest.raises(Refusal, match="web1 is running now \\(read just now\\): there is nothing to start"):
+        p.ask(f["hook"], *page_args(f, b["values"], accepted={ACCEPT_COSTS}))
+
+
+def test_a_second_confirmation_counts_only_when_exactly_true(read):
+    """The page sends JSON true; "false", "yes" or 1 from a program on this PC is refused like none (the audit)."""
+    p, fake = read
+    for almost in ("false", "yes", "true", 1, "1", [True]):
+        with pytest.raises(Refusal) as refused:
+            p.power("web-rg", "web1", "poweroff", accept_still_billed=almost)
+        assert refused.value.accept == ACCEPT_BILLED
+        with pytest.raises(Refusal) as refused:
+            p.power("web-rg", "win1", "start", accept_costs=almost)
+        assert refused.value.accept == ACCEPT_COSTS
+        with pytest.raises(Refusal) as refused:
+            p.add_rule("web-rg", "web1-nsg", "ssh-anywhere", "Inbound", "Allow", "Tcp", "22", "*", None, 200, None, almost)
+        assert refused.value.accept == ACCEPT_RISKY
+    assert fake.writes() == [] and fake.vms["web1"]["power"] == "running" and fake.vms["win1"]["power"] == "deallocated"
 
 
 def test_power_off_still_bills_so_it_is_sent_only_once_that_is_accepted(read):
@@ -213,20 +258,33 @@ def test_a_rule_is_added_and_removed_as_the_reference_gives_it(read):
     assert rep["ok"] and rep["said"] == "added allow-web: Allow inbound Tcp to ports 80, 8080-8090 from 203.0.113.7 to any, priority 320"
     r = last(fake, "PUT")
     assert r["path"] == f"{ARM}/resourceGroups/web-rg/providers/Microsoft.Network/networkSecurityGroups/web1-nsg/securityRules/allow-web"
-    assert r["query"] == {"api-version": "2026-01-01"}
+    assert r["query"] == {"api-version": "2026-01-01"} and r["headers"]["If-None-Match"] == "*"  # never one replaced
+    before = [x for x in fake.requests if x["method"] == "GET"][-1]  # the group read just before
+    assert before["path"] == f"{ARM}/resourceGroups/web-rg/providers/Microsoft.Network/networkSecurityGroups/web1-nsg"
     assert r["body"] == {"properties": {"protocol": "Tcp", "access": "Allow", "direction": "Inbound", "priority": 320,
                                         "sourcePortRange": "*", "destinationPortRanges": ["80", "8080-8090"],
                                         "sourceAddressPrefix": "203.0.113.7", "destinationAddressPrefix": "*",
                                         "description": "the web"}}
     rows = next(t for t in p.status()["tables"] if t["title"] == "web1-nsg rules")["rows"]
     assert ["320", {"text": "allow-web", "sub": "the web"}] == rows[2][:2]  # drawn as it is now, by priority
-    for values, why in (({"name": "allow-web", "priority": "330"}, "named allow-web already"),
+    for values, why in (({"name": "allow-web", "priority": "330"}, "has a rule named allow-web \\(read just now\\)"),
                         ({"name": "x2", "priority": "300"}, "priority 300 is allow-ssh-home's"),
                         ({"name": "x3", "priority": "99"}, "100 to 4096"),
                         ({"name": "x4", "priority": "340", "ports": "70000"}, "not a port")):
         full = {"direction": "Inbound", "access": "Allow", "protocol": "Tcp", "ports": "81", "source": "10.0.0.0/8", **values}
         with pytest.raises(ValueError, match=why):
             p.ask(f["hook"], *page_args(f, full))
+    with pytest.raises(ValueError, match="no source given"):  # an empty Source never opens the whole internet
+        p.ask(f["hook"], *page_args(f, {"name": "x5", "direction": "Inbound", "access": "Allow", "protocol": "Tcp",
+                                        "ports": "5432", "source": "", "priority": "350"}))
+    # a rule of that name made in the portal since the last read: refused, never replaced
+    fake.nsgs["web1-nsg"]["rules"].append(rule("allow-portal", 360, "22", "198.51.100.0/24"))
+    puts = len([x for x in fake.requests if x["method"] == "PUT"])
+    with pytest.raises(Refusal, match="has a rule named allow-portal \\(read just now\\): it is never replaced"):
+        p.ask(f["hook"], *page_args(f, {"name": "allow-portal", "direction": "Inbound", "access": "Allow", "protocol": "Tcp",
+                                        "ports": "8080", "source": "203.0.113.9", "priority": "370"}))
+    assert len([x for x in fake.requests if x["method"] == "PUT"]) == puts
+    assert fake.nsgs["web1-nsg"]["rules"][-1]["properties"]["destinationPortRange"] == "22"
     b = row_button(p, "web1-nsg rules", "Remove allow-web")
     rf = forms[b["form"]]
     rep = p.ask(rf["hook"], *page_args(rf, b["values"]))
@@ -277,11 +335,25 @@ def test_an_ssh_key_is_added_and_removed(read):
     r = last(fake, "PUT")
     assert r["path"] == f"{ARM}/resourceGroups/web-rg/providers/Microsoft.Compute/sshPublicKeys/desk"
     assert r["query"] == {"api-version": "2026-04-01"} and r["body"] == {"location": "eastus", "properties": {"publicKey": key}}
+    assert r["headers"]["If-None-Match"] == "*"  # never one replaced
+    looked = [x for x in fake.requests if x["method"] == "GET"][-1]  # looked for just before
+    assert looked["path"] == f"{ARM}/resourceGroups/web-rg/providers/Microsoft.Compute/sshPublicKeys/desk"
+    # a key of that name made since the last read: refused, never replaced
+    fake.keys[("web-rg", "portal-key")] = {"location": "eastus", "key": ssh_key(comment="portal")}
+    with pytest.raises(Refusal, match="holds an SSH key named portal-key \\(read just now\\)"):
+        p.ask(f["hook"], "web-rg", "portal-key", key, None)
+    assert fake.keys[("web-rg", "portal-key")]["key"].endswith("portal")
+    # a private key pasted: refused before anything is sent, without a word of it said back
+    private = "-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAAB -----END OPENSSH PRIVATE KEY-----"
+    calls = len(fake.requests)
+    with pytest.raises(ValueError, match="that is a private key") as refused:
+        p.ask(f["hook"], "web-rg", "oops", private, None)
+    assert "b3BlbnNz" not in str(refused.value) and len(fake.requests) == calls
     for bad, why in ((ssh_key("ssh-rsa", 1024), "1024 bits"), ("ssh-dss AAAAB3NzaC1kc3MAAACBAP", "not taken by Azure|base64"),
                      ("not a key", "not an SSH public key")):
         with pytest.raises(ValueError, match=why):
             p.ask(f["hook"], "web-rg", "desk2", bad, None)
-    with pytest.raises(Refusal, match="named desk already"):
+    with pytest.raises(Refusal, match="holds an SSH key named desk \\(read just now\\)"):
         p.ask(f["hook"], "web-rg", "desk", key, None)
     b = row_button(p, "SSH public keys", "Remove the SSH key desk")
     rf = forms[b["form"]]
@@ -289,3 +361,16 @@ def test_an_ssh_key_is_added_and_removed(read):
     assert rep["ok"] and ("web-rg", "desk") not in fake.keys
     r = last(fake, "DELETE")
     assert r["path"].endswith("/sshPublicKeys/desk") and r["query"] == {"api-version": "2026-04-01"}
+
+
+def test_no_key_is_added_blind_when_the_keys_could_not_be_read(made, env):
+    """The audit: with the key list failed, Add was offered over an empty list and replaced a stored key."""
+    env(settings_of())
+    fake = FakeAzure()
+    fake.fail["keys"] = (500, "InternalServerError", "busy")
+    p, fake = made(fake)
+    p.refresh()
+    st = p.status()
+    assert not {"key-add", "key-remove"} & {f["id"] for f in st["forms"]}
+    keys = next(t for t in st["tables"] if t["title"] == "SSH public keys")
+    assert keys["note"].startswith("not read:") and "actions" not in keys

@@ -59,6 +59,7 @@ SSH_KEY = SUBSCRIPTION + "/resourceGroups/{resourceGroupName}/providers/Microsof
 NICS = SUBSCRIPTION + "/providers/Microsoft.Network/networkInterfaces"
 PUBLIC_IPS = SUBSCRIPTION + "/providers/Microsoft.Network/publicIPAddresses"
 NSGS = SUBSCRIPTION + "/providers/Microsoft.Network/networkSecurityGroups"
+NSG = SUBSCRIPTION + "/resourceGroups/{resourceGroupName}/providers/Microsoft.Network/networkSecurityGroups/{networkSecurityGroupName}"
 RULE = (SUBSCRIPTION + "/resourceGroups/{resourceGroupName}/providers/Microsoft.Network/networkSecurityGroups/"
         "{networkSecurityGroupName}/securityRules/{securityRuleName}")
 COST = SUBSCRIPTION + "/providers/Microsoft.CostManagement/query"
@@ -79,12 +80,16 @@ USED = (  # every call the client makes, as the API card names them (method, pat
     ("POST", TOKEN, "identity"), ("GET", SUBSCRIPTION, "arm"), ("GET", GROUPS, "arm"), ("GET", RESOURCES, "arm"),
     ("GET", VMS, "arm"), ("GET", VM_VIEW, "arm"), ("POST", VM_START, "arm"), ("POST", VM_RESTART, "arm"),
     ("POST", VM_DEALLOCATE, "arm"), ("POST", VM_POWER_OFF, "arm"), ("GET", DISKS, "arm"), ("GET", SSH_KEYS, "arm"),
-    ("PUT", SSH_KEY, "arm"), ("DELETE", SSH_KEY, "arm"), ("GET", NICS, "arm"), ("GET", PUBLIC_IPS, "arm"),
-    ("GET", NSGS, "arm"), ("PUT", RULE, "arm"), ("DELETE", RULE, "arm"), ("POST", COST, "arm"), ("GET", ZONES, "dns"),
+    ("GET", SSH_KEY, "arm"), ("PUT", SSH_KEY, "arm"), ("DELETE", SSH_KEY, "arm"), ("GET", NICS, "arm"),
+    ("GET", PUBLIC_IPS, "arm"), ("GET", NSGS, "arm"), ("GET", NSG, "arm"), ("PUT", RULE, "arm"), ("DELETE", RULE, "arm"),
+    ("POST", COST, "arm"), ("GET", ZONES, "dns"),
     ("GET", ZONE_ALL, "dns"), ("GET", RECORD_SET, "dns"), ("PUT", RECORD_SET, "dns"), ("DELETE", RECORD_SET, "dns"),
     ("GET", RETAIL, "prices"),
 )
-NOT_REGISTERED = frozenset({"MissingSubscriptionRegistration", "NoRegisteredProviderFound"})
+# the subscription not registered for a provider: nothing of it was ever made there, so a list of it is empty. Not
+# NoRegisteredProviderFound: Resource Manager also answers it for an API version it does not serve, which is a fault to
+# show, never "nothing there" (the audit, 2026-11-11)
+NOT_REGISTERED = frozenset({"MissingSubscriptionRegistration"})
 
 # Resource Manager's error codes (its troubleshooting page) in words of what to do; Azure's own words follow them
 ADVICE = {
@@ -319,8 +324,9 @@ class AzureApi:
             link = data.get("NextPageLink") if isinstance(data, Mapping) else None
             if isinstance(link, str):
                 parts = urlsplit(link)
-                if parts.scheme == "https" and parts.hostname == "prices.azure.com":
-                    return link, {}
+                if parts.scheme == "https" and parts.hostname == "prices.azure.com" and parts.port in (None, 443):
+                    # its own host, written as the reference's example writes it (prices.azure.com:443): asked as the base
+                    return parts._replace(netloc="prices.azure.com").geturl(), {}
             return None
         return list(self.prices.pages(url, None, items="Items", next_of=next_of, most=5))
 
@@ -360,9 +366,21 @@ class AzureApi:
                                            "relativeRecordSetName": plan.name}, {"api-version": V_DNS},
                     headers={"If-Match": plan.etag} if plan.etag else None, client=self.dns)
 
+    def nsg(self, group: str, name: str) -> dict | None:
+        """A network security group as it is now, its rules and what it is attached to (None: there is none)."""
+        try:
+            data = self.arm.get(self.path(NSG, resourceGroupName=group, networkSecurityGroupName=name), {"api-version": V_NETWORK})
+        except RestError as e:
+            if e.status == 404:
+                return None
+            raise
+        return data if isinstance(data, Mapping) else None
+
     def put_rule(self, group: str, nsg: str, rule: nsg_rules.Rule) -> dict:
+        """A new rule made, never one of its name replaced: If-None-Match: * (the caller has read the group just before
+        and found no rule of that name)."""
         answer = self._write("PUT", RULE, {"resourceGroupName": group, "networkSecurityGroupName": nsg, "securityRuleName": rule.name},
-                             {"api-version": V_NETWORK}, json=nsg_rules.body(rule))
+                             {"api-version": V_NETWORK}, json=nsg_rules.body(rule), headers={"If-None-Match": "*"})
         return answer.data if isinstance(answer.data, Mapping) else {}
 
     def delete_rule(self, group: str, nsg: str, name: str) -> int:
@@ -370,9 +388,21 @@ class AzureApi:
                              {"api-version": V_NETWORK})
         return answer.status
 
+    def ssh_key(self, group: str, name: str) -> dict | None:
+        """An SSH public key resource as it is now (None: there is none)."""
+        try:
+            data = self.arm.get(self.path(SSH_KEY, resourceGroupName=group, sshPublicKeyName=name), {"api-version": V_COMPUTE})
+        except RestError as e:
+            if e.status == 404:
+                return None
+            raise
+        return data if isinstance(data, Mapping) else None
+
     def put_ssh_key(self, group: str, name: str, location: str, public_key: str) -> dict:
+        """A new key resource made, never one of its name replaced: If-None-Match: * (the caller has looked for one of that
+        name just before and found none)."""
         answer = self._write("PUT", SSH_KEY, {"resourceGroupName": group, "sshPublicKeyName": name}, {"api-version": V_COMPUTE},
-                             json={"location": location, "properties": {"publicKey": public_key}})
+                             json={"location": location, "properties": {"publicKey": public_key}}, headers={"If-None-Match": "*"})
         return answer.data if isinstance(answer.data, Mapping) else {}
 
     def delete_ssh_key(self, group: str, name: str) -> int:

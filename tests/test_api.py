@@ -66,6 +66,42 @@ def test_a_provider_the_subscription_is_not_registered_for_reads_as_none():
     assert api.nsgs() == []
 
 
+def test_an_api_version_resource_manager_does_not_serve_is_a_fault_never_nothing_there():
+    """NoRegisteredProviderFound is also Resource Manager's answer for an API version it does not serve (the audit): said
+    under the table, never shown as an empty subscription."""
+    fake = FakeAzure()
+    fake.fail["vms"] = (400, "NoRegisteredProviderFound", "No registered resource provider found for location 'eastus' and "
+                        "API version '2026-04-01' for type 'virtualMachines'.")
+    api, _ = client(fake)
+    with pytest.raises(RestError, match="API version '2026-04-01'"):
+        api.vms()
+
+
+def test_a_price_lists_next_page_on_its_own_host_is_followed_as_the_base():
+    """The Retail Prices API writes its NextPageLink with the port (https://prices.azure.com:443/...): asked as the base,
+    so the library's check that a next page stays on the client's host lets it through."""
+    fake = FakeAzure()
+    api, _ = client(fake)
+    real = fake.answer
+    asked = []
+
+    def paged(method, host, path, query, headers, data):
+        from urllib.parse import quote
+
+        status, got, answer = real(method, host, path, query, headers, data)
+        if host == "prices.azure.com":
+            asked.append(query.get("$skip"))
+            if "$skip" not in query:
+                answer = {**answer, "NextPageLink": "https://prices.azure.com:443/api/retail/prices?api-version=2023-01-01-preview"
+                                                    f"&meterRegion=%27primary%27&$filter={quote(query['$filter'], safe='')}&$skip=1000"}
+            else:
+                answer = {**answer, "Items": [], "NextPageLink": None}
+        return status, got, answer
+    fake.answer = paged
+    assert len(api.prices_of("eastus", "Standard_B1s")) == 4 and asked == [None, "1000"]
+    assert all(r["url"].startswith("https://prices.azure.com/api/retail/prices") for r in fake.requests if r["host"] == "prices.azure.com")
+
+
 def test_a_list_is_followed_across_its_pages_on_resource_managers_host_alone():
     fake = FakeAzure()
     api, _ = client(fake)

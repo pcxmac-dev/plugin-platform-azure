@@ -343,12 +343,26 @@ class FakeAzure:
         if g:
             group, name = g.groups()
             self.version(query, "compute")
+            if method == "GET":
+                return self.ok(self.key_json(group, name)) if (group, name) in self.keys else \
+                    cloud_error(404, "ResourceNotFound", f"The Resource 'Microsoft.Compute/sshPublicKeys/{name}' was not found.")
             if method == "PUT":
                 assert set(data) == {"location", "properties"} and set(data["properties"]) == {"publicKey"}, data
+                if headers.get("If-None-Match") == "*" and (group, name) in self.keys:
+                    return cloud_error(412, "PreconditionFailed", "The resource exists.")
                 self.keys[(group, name)] = {"location": data["location"], "key": data["properties"]["publicKey"]}
                 return self.ok(self.key_json(group, name), 201)
             assert method == "DELETE"
             return self.ok(None, 200 if self.keys.pop((group, name), None) else 204)
+        g = m(r"/resourceGroups/([^/]+)/providers/Microsoft\.Network/networkSecurityGroups/([^/]+)", rest)
+        if g:
+            group, nsg = g.groups()
+            self.version(query, "network")
+            assert method == "GET"
+            if self.failing("nsg"):
+                return self.failing("nsg")
+            return self.ok(self.nsg_json(nsg)) if nsg in self.nsgs and self.nsgs[nsg]["group"] == group else \
+                cloud_error(404, "ResourceNotFound", f"The Resource 'Microsoft.Network/networkSecurityGroups/{nsg}' was not found.")
         g = m(r"/resourceGroups/([^/]+)/providers/Microsoft\.Network/networkSecurityGroups/([^/]+)/securityRules/([^/]+)", rest)
         if g:
             group, nsg, name = g.groups()
@@ -356,6 +370,8 @@ class FakeAzure:
             rules = self.nsgs[nsg]["rules"]
             if method == "PUT":
                 assert set(data) == {"properties"}, data
+                if headers.get("If-None-Match") == "*" and any(r["name"] == name for r in rules):
+                    return cloud_error(412, "PreconditionFailed", "The resource exists.")
                 rules[:] = [r for r in rules if r["name"] != name] + [{"name": name, "properties": {**data["properties"],
                                                                                                     "provisioningState": "Succeeded"}}]
                 return self.ok({"name": name, "id": rid(group, "Microsoft.Network", "networkSecurityGroups", nsg) + f"/securityRules/{name}",
@@ -411,6 +427,12 @@ class FakeAzure:
         return None if held is None else held["properties"]
 
 
+class Platform:
+    """The platform app as a plugin sees it attach it (its NAME): the one app whose attaching starts the reading."""
+
+    NAME = "platform"
+
+
 class Pairs(Login):
     """A login holding pairs by name (the login app's store, as the Login interface asks it)."""
 
@@ -438,21 +460,22 @@ def settings_of(api: bool = True, ddns: bool = False, **more) -> dict[str, str]:
     if api:
         out.update({"AZURE_TENANT_ID": TENANT, "AZURE_CLIENT_ID": CLIENT, "AZURE_CLIENT_SECRET": SECRET, "AZURE_SUBSCRIPTION_ID": SUB})
     if ddns:
-        out.update({"AZURE_DDNS_HOSTS": "home.example.com"})
+        out.update({"AZURE_DDNS_HOSTS": "new.example.com"})  # a host with no record yet: Dynamic DNS's own to make
     out.update(more)
     return out
 
 
 @pytest.fixture(autouse=True)
-def _no_azure_no_network(monkeypatch):
+def _no_azure_no_network(monkeypatch, tmp_path):
     """No test reaches Azure, a resolver or this machine's settings: HTTPS and nslookup refused, every AZURE_ variable
-    cleared."""
+    cleared, the platform's folder (the Dynamic DNS state's) the test's own."""
     def refused(*a, **k):
         raise AssertionError("a test reached for the network")
     monkeypatch.setattr(rest_mod, "_requests_transport", refused)
     monkeypatch.setattr(dns_mod, "query", refused)
     for n in NAMES:
         monkeypatch.delenv(n, raising=False)
+    monkeypatch.setenv("LIMINAL_PLATFORM_DIR", str(tmp_path / "platform"))
 
 
 @pytest.fixture
@@ -466,9 +489,14 @@ def env(monkeypatch):
 
 @pytest.fixture
 def made():
-    """A plugin over the stand-ins: (plugin, fake Azure)."""
+    """A plugin over the stand-ins: (plugin, fake Azure). `public`: this network's address as asked (a list: one answer
+    after another, the last kept)."""
     def make(fake: FakeAzure | None = None, public=(HOME, "a stand-in")):
         fake = fake or FakeAzure()
-        p = AzurePlugin(transport=fake, public=(lambda: public), sleep=lambda s: None)
+        answers = list(public) if isinstance(public, list) else [public]
+
+        def ask():
+            return answers.pop(0) if len(answers) > 1 else answers[0]
+        p = AzurePlugin(transport=fake, public=ask, sleep=lambda s: None)
         return p, fake
     return make
