@@ -807,7 +807,7 @@ class AzurePlugin(MachinePlugin):
         interface = super().attach(app, login)
         with self._rt.lock:
             self._rt.config = None
-        if getattr(app, "NAME", "") == "platform":
+        if getattr(app, "NAME", "") == "platform" and not getattr(app, "once", False):  # never a one-shot command's
             self._start()
         return interface
 
