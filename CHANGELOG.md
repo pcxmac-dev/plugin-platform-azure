@@ -12,7 +12,11 @@ What the re-verification of the audit's fixes found in Dynamic DNS (liminal-libs
   `AZURE_DDNS_HOSTS` setting, after each refresh and before each pass, and only once the subscription's zones are read
   (never on a zone list not read). Put back in the setting later, it is left as it is, its row offering Take over…
   again. It replaces the plugin's own letting go.
-- Needs liminal-libs 1.49.7.
+- The third round of checks (liminal-libs 1.49.8): a take-over is used up once its write lands (the host the keeper's
+  own from then on); only the serving platform's plugin settles, so its own command line, run from a shell without
+  `AZURE_DDNS_HOSTS`, never empties `ddns.json`; a Take over… refused because the record changed brings the host's row
+  up to date first, so it offers what the record holds now.
+- Needs liminal-libs 1.49.8.
 
 ## 0.1.1 (2026-11-11)
 

@@ -170,19 +170,22 @@ Each host in `AZURE_DDNS_HOSTS` that is in one of the subscription's Azure DNS z
 IPv4 address (the library's `machines.ddns.Keeper`), but only when its record is Dynamic DNS's own: a host with no A
 record (made, with a TTL of 300 seconds), one already pointing here or at the address it set last, or one you took over.
 Any other record (another address, or several) is left as it is, its row saying what it holds and offering **Take
-over…**: asked twice (its words name what the record holds and that it will point here; then that every address it
-holds is dropped at once, `accept_take_over`), and only while the record still holds what the page showed, the host's
-A record is set to this network's address alone and kept there. Several addresses are never cut to one unasked. What is its own is kept
-in the platform's folder (`LIMINAL_PLATFORM_DIR`, else the data folder's `platform/`), under `azure/ddns.json`.
+over…**: asked twice (its words name what the record holds and that it will point here; then that every address it holds
+is dropped at once, `accept_take_over`), and only while the record still holds what the page showed (else its row is
+brought up to date, offering what it holds now), the host's A record is set to this network's address alone and kept
+there: the consent is used up once that write lands, the host Dynamic DNS's own from then on. Several addresses are
+never cut to one unasked. What is its own is kept in the platform's folder (`LIMINAL_PLATFORM_DIR`, else the data
+folder's `platform/`), under `azure/ddns.json`.
 
 This network's address is asked of OpenDNS's resolver (`myip.opendns.com`), else Google's (`o-o.myaddr.l.google.com`),
-each by its own address, and asked again just before a write (nothing is written if it changed meanwhile). Each host's
-A record set is written with its etag, its TTL and metadata kept. **Update DNS now** (confirmed) writes every host of its
-own. A host taken out of the setting is let go (`Keeper.settle`, with the whole setting once the zones are read: while
-the plugin ran or not), and put back later it is left as it is until taken over again; a host whose A record you set by
-hand on the page is let go too (left as you set it, until you take it over again). An alias record set, a name that is a CNAME, or a zone name two resource
-groups hold, is not written: its row says why. A host in no zone of the subscription is said in the plugin's problem,
-and with no host in any zone, not even this network's address is asked.
+each by its own address, and asked again just before a write (nothing is written if it changed meanwhile). Each host's A
+record set is written with its etag, its TTL and metadata kept. **Update DNS now** (confirmed) writes every host of its
+own. A host taken out of the setting is let go by the platform serving the plugin (`Keeper.settle`, with the whole
+setting once the zones are read; never from the plugin's own command line, whose shell may lack the setting), and put
+back later holding another address it is left as it is until taken over again; a host whose A record you set by hand on
+the page is let go too (left as you set it, until you take it over again). An alias record set, a name that is a CNAME,
+or a zone name two resource groups hold, is not written: its row says why. A host in no zone of the subscription is said
+in the plugin's problem, and with no host in any zone, not even this network's address is asked.
 
 ## Valid, and the platform
 

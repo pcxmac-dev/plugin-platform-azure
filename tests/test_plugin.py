@@ -10,19 +10,10 @@ import time
 import pytest
 
 import plugin_platform_azure.__main__ as cli
-from conftest import CLIENT, HOME, SECRET, SUB, TENANT, FakeAzure, Pairs, Platform, settings_of
+from conftest import CLIENT, HOME, SECRET, SUB, TENANT, FakeAzure, Pairs, Platform, settings_of, wait_until
 from plugin_platform_azure import NOT_SET, RETRY_S
 from plugin_platform_azure.page import BILLING
 from plugin_platform_azure.settings import read
-
-
-def wait_until(test, seconds=5.0):
-    end = time.monotonic() + seconds
-    while time.monotonic() < end:
-        if test():
-            return True
-        time.sleep(0.02)
-    return False
 
 
 def tables(st: dict) -> dict:

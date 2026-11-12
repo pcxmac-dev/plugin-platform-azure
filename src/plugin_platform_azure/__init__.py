@@ -92,6 +92,13 @@ def _fqdn(text: str) -> str:
     return name[2:] if name.startswith("@.") else name
 
 
+def serving(app) -> bool:
+    """Whether `app` is the platform serving its plugins (not one of its one-shot commands, nor another app, nor the
+    plugin's own command line, which attaches to nothing): the one app whose plugin reads in the background and settles
+    the Dynamic DNS hosts."""
+    return app is not None and getattr(app, "NAME", "") == "platform" and not getattr(app, "once", False)
+
+
 def accepted(value) -> bool:
     """A second confirmation counts only when it is exactly true (the page sends JSON true): "false", "yes" or 1 from a
     program on this PC is refused like none."""
@@ -738,17 +745,20 @@ class AzurePlugin(MachinePlugin):
         return hosts, [scrub(w, secrets) for w in wrong]
 
     def _settle(self, cfg: Config, snap: model.Snapshot | None) -> list[str]:
-        """The keeper's hosts no longer in the Dynamic DNS setting let go (Keeper.settle: taken out while the plugin ran or
-        not, a host put back is left as it is until taken over again). Only with the whole setting, and only once the
+        """The keeper's hosts no longer in the Dynamic DNS setting let go (Keeper.settle: a host put back is left as it is
+        until taken over again). Only by the serving platform's plugin: its own command line (python -m
+        plugin_platform_azure status, ...) runs from a shell whose setting may lack AZURE_DDNS_HOSTS, and would empty the
+        shared ddns.json, forgetting every record of its own. Only with the whole setting, and only once the
         subscription's zones are read: never on a zone list not read (which would let every host go)."""
-        if snap is None or snap.troubles.get("zones"):
+        if not serving(self.app) or snap is None or snap.troubles.get("zones"):
             return []
         return self.keeper().settle([_fqdn(text) for text in cfg.hosts])
 
     def _ddns_pass(self, cfg: Config, hosts: list, force: bool = False, stop: threading.Event | None = None,
                    wait: float = 120.0) -> list[dict]:
         """A Dynamic DNS pass over `hosts` with these settings (none read again during it), the zones as last read, and
-        `stop` (the plugin detached ends it before its next write). The hosts taken out of the setting are let go first."""
+        `stop` (the plugin detached ends it before its next write). The hosts taken out of the setting are let go first
+        (by the serving platform's plugin)."""
         snap = self._snap_of(cfg)
         if snap is None:
             raise ValueError("the subscription's zones are not read yet")
@@ -787,8 +797,11 @@ class AzurePlugin(MachinePlugin):
         """A host the keeper left as it is (it holds another address, or several) taken over, asked twice (the page's
         Take over…: its confirmation names what it holds, then the keeper refuses until `accept_take_over` is exactly
         true, as it drops every address it holds at once). The host must be in the setting and its record still hold what
-        the page showed (read now); then a pass for that host sets its A record to this network's address alone, and keeps
-        it there."""
+        the page showed (read now); then a pass for that host sets its A record to this network's address alone, the consent
+        used up once that write lands (the keeper's own from then on, kept there by its own rule). Refused because the
+        record changed, the host's row is brought up to date first (a pass for it, by the keeper's own rule), so its
+        Take over… offers what it holds now; a record that is the keeper's own by then (none, or pointing here) is kept so,
+        with nothing to take over."""
         cfg = self.config(fresh=True)
         hosts = self._ddns_ready(cfg)
         want = str(host or "").strip().rstrip(".").lower()
@@ -801,8 +814,13 @@ class AzurePlugin(MachinePlugin):
         now = held.values if held is not None else []
         shown = [a.strip() for a in str(holds or "").replace(";", ",").split(",") if a.strip()]
         if holds is not None and sorted(shown) != sorted(now):
-            raise Refusal(f"{h.fqdn} holds {', '.join(now) or 'nothing'} now, not {', '.join(shown) or 'nothing'} as shown: "
-                          "nothing taken over (look at it again, then take it over)")
+            out = self._ddns_pass(cfg, [h], force=False, stop=self._rt.stop)  # its row as it is now (writing only its own)
+            st = out[0] if out else {}
+            was = f"{h.fqdn} holds {', '.join(now) or 'nothing'} now, not {', '.join(shown) or 'nothing'} as shown"
+            if st.get("ok") and not st.get("foreign"):  # the keeper's own by now (no record, pointing here): kept so
+                return {"host": h.fqdn, "ok": True, "said": f"{was}: nothing to take over: {st.get('result')}", "lines": [],
+                        "state": st}
+            raise Refusal(f"{was}: nothing taken over (look at it again, then take it over)")
         keeper = self.keeper()
         keeper.take_over(h.fqdn, accept=accept_take_over, holds=", ".join(now) or "nothing")  # TakeOverRefused unless exactly true
         out = self._ddns_pass(cfg, [h], force=False, stop=self._rt.stop)
@@ -819,7 +837,7 @@ class AzurePlugin(MachinePlugin):
         interface = super().attach(app, login)
         with self._rt.lock:
             self._rt.config = None
-        if getattr(app, "NAME", "") == "platform" and not getattr(app, "once", False):  # never a one-shot command's
+        if serving(app):  # never a one-shot command's
             self._start()
         return interface
 

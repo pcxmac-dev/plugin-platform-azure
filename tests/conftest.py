@@ -9,6 +9,7 @@ import base64
 import json
 import re
 import struct
+import time
 from urllib.parse import parse_qs, unquote, urlsplit
 
 import pytest
@@ -425,6 +426,16 @@ class FakeAzure:
     def record(self, name, rtype, zone=("dns-rg", "example.com")):
         held = self.zones[zone].get((name, rtype))
         return None if held is None else held["properties"]
+
+
+def wait_until(test, seconds=5.0):
+    """Whether `test()` came true within `seconds` (the background's work, waited for)."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        if test():
+            return True
+        time.sleep(0.02)
+    return False
 
 
 class Platform:

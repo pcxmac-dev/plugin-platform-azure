@@ -9,9 +9,9 @@ description = "Microsoft Azure for Liminal's platform: a subscription's VMs with
 readme = "README.md"
 requires-python = ">=3.10"
 # the library it plugs into (the machine kind: liminal_libs.machines, plugin API 2.2; RestClient, TokenSource and the
-# Dynamic DNS keeper: liminal_libs.machines.rest and .ddns, 1.49.7's keeper changing only what is its own, a take-over
-# asked twice, settle; the Login interface: liminal_libs.apps)
-dependencies = ["liminal-libs>=1.49.7"]
+# Dynamic DNS keeper: liminal_libs.machines.rest and .ddns, 1.49.8's keeper changing only what is its own, a take-over
+# asked twice and used up once its write lands, settle; the Login interface: liminal_libs.apps)
+dependencies = ["liminal-libs>=1.49.8"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
