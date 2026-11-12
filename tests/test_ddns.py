@@ -1,18 +1,22 @@
-"""Dynamic DNS through Azure DNS (the library's Keeper, liminal-libs 1.49.2): this network's public IPv4 address asked of
+"""Dynamic DNS through Azure DNS (the library's Keeper, liminal-libs 1.49.7): this network's public IPv4 address asked of
 the name servers the plugin names, each host's A record set read, and written (with its etag, its TTL and metadata kept)
 only when it is the keeper's own: a host with no record (made), one pointing here or at the address the keeper set last
-(kept in the platform's folder: azure/ddns.json), or one the user took over on the page. A host holding another address,
-or several, is left as it is and offered Take over…; several addresses are never cut to one unasked. Update DNS now is a
-confirmed form; a pass ends once the plugin is detached, and reads no settings while it runs."""
+(kept in the platform's folder: azure/ddns.json), or one the user took over on the page (asked twice). A host holding
+another address, or several, is left as it is and offered Take over…; several addresses are never cut to one unasked. A
+host taken out of the setting is let go (Keeper.settle, once the zones are read). Update DNS now is a confirmed form; a
+pass ends once the plugin is detached, and reads no settings while it runs."""
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 
 import pytest
 
-from conftest import HOME, SECRET, settings_of
-from plugin_platform_azure import PUBLIC_IPV4, ddns_state_file
+from conftest import HOME, SECRET, FakeAzure, settings_of
+from liminal_libs.machines.ddns import ACCEPT as ACCEPT_TAKE_OVER
+from liminal_libs.machines.ddns import TakeOverRefused
+from plugin_platform_azure import PUBLIC_IPV4, AzurePlugin, ddns_state_file
 
 OTHER = "93.184.216.99"  # this network's address after the router came back with another
 
@@ -59,20 +63,44 @@ def test_a_host_holding_another_address_is_left_as_it_is_and_offered_take_over(m
     assert ddns_state_file().as_posix().endswith("platform/azure/ddns.json")
 
 
-def test_take_over_then_a_pass_sets_it(made, env):
+def test_take_over_is_asked_twice_and_only_then_a_pass_sets_it(made, env):
+    """Take over… sets the record at once and drops what it holds, so one yes is not enough (the re-verification):
+    without accept_take_over exactly true it is refused naming it, and nothing is taken."""
     env(settings_of(AZURE_DDNS_HOSTS="home.example.com"))
     p, fake = made()
     p.ddns_update(force=False)
     assert a_record(fake, "home") == ["198.51.100.7"]
     take = {f["id"]: f for f in p.status()["forms"]}["ddns-take"]
-    assert [x["name"] for x in take["fields"]] == ["host", "holds"] and take["confirm"]["danger"] is True
-    rep = p.ask("ddns_take_over", "home.example.com", "198.51.100.7")
+    assert [x["name"] for x in take["fields"]] == list(inspect.signature(p.ddns_take_over).parameters) == [
+        "host", "holds", ACCEPT_TAKE_OVER] and take["confirm"]["danger"] is True
+    assert take["fields"][-1]["type"] == "accept" and ACCEPT_TAKE_OVER == "accept_take_over"
+    with pytest.raises(TakeOverRefused) as refused:  # the first confirmation alone
+        p.ask("ddns_take_over", "home.example.com", "198.51.100.7")
+    assert refused.value.accept == "accept_take_over" and "home.example.com holds 198.51.100.7" in str(refused.value)
+    assert not p.keeper().taken("home.example.com") and p.keeper().known() == [] and puts(fake) == []
+    for almost in ("true", 1, "yes"):
+        with pytest.raises(TakeOverRefused):
+            p.ask("ddns_take_over", "home.example.com", "198.51.100.7", almost)
+        assert not p.keeper().taken("home.example.com") and puts(fake) == []
+    assert a_record(fake, "home") == ["198.51.100.7"]
+    rep = p.ask("ddns_take_over", "home.example.com", "198.51.100.7", True)
     assert rep["ok"] is True and rep["said"] == "home.example.com taken over: set (was 198.51.100.7)"
-    assert a_record(fake, "home") == [HOME]
+    assert a_record(fake, "home") == [HOME] and p.keeper().taken("home.example.com")
     put = puts(fake)[-1]
     assert put["headers"]["If-Match"] and put["body"] == {"properties": {"TTL": 300, "ARecords": [{"ipv4Address": HOME}]}}
     with pytest.raises(ValueError, match="none of the Dynamic DNS hosts"):
-        p.ask("ddns_take_over", "www.example.com", "")
+        p.ask("ddns_take_over", "www.example.com", "", True)
+
+
+def test_take_over_is_refused_when_the_record_changed_since_the_page_showed_it(made, env):
+    env(settings_of(AZURE_DDNS_HOSTS="home.example.com"))
+    p, fake = made()
+    p.ddns_update(force=False)
+    zone = fake.zones[("dns-rg", "example.com")]
+    zone[("home", "A")] = fake._recordset("home", "A", {"TTL": 300, "ARecords": [{"ipv4Address": "198.51.100.8"}]})
+    with pytest.raises(ValueError, match="holds 198.51.100.8 now, not 198.51.100.7 as shown: nothing taken over"):
+        p.ask("ddns_take_over", "home.example.com", "198.51.100.7", True)
+    assert not p.keeper().taken("home.example.com") and a_record(fake, "home") == ["198.51.100.8"] and puts(fake) == []
 
 
 def test_a_host_with_several_addresses_is_never_cut_to_one(made, env):
@@ -108,24 +136,61 @@ def test_a_host_set_by_hand_is_let_go_and_left_as_set(made, env):
     assert out[0]["foreign"] is True and a_record(fake, "new") == ["203.0.113.5"]
 
 
-def test_a_host_taken_out_of_the_settings_is_let_go(made, env, monkeypatch):
+def test_a_host_taken_over_then_taken_out_of_the_setting_is_let_go_and_put_back_left_as_it_is(env, monkeypatch):
+    """Keeper.settle with the whole setting: a host taken over, then taken out of the setting, is let go by the next pass
+    (the address it was set to forgotten with it). Put back in the setting later (the router came back with another
+    address meanwhile), it is left as it is, its row offering Take over… again."""
     env(settings_of(AZURE_DDNS_HOSTS="new.example.com, home.example.com"))
-    p, fake = made()
+    fake, network = FakeAzure(), [HOME]
+    p = AzurePlugin(transport=fake, public=lambda: (network[0], "a stand-in"), sleep=lambda s: None)
     p.ddns_update(force=False)
-    p.ask("ddns_take_over", "home.example.com", "198.51.100.7")
+    p.ask("ddns_take_over", "home.example.com", "198.51.100.7", True)
     keeper = p.keeper()
-    assert keeper.own("new.example.com") == HOME and keeper.taken("home.example.com")
+    assert keeper.taken("home.example.com") and keeper.own("home.example.com") == HOME and a_record(fake, "home") == [HOME]
     monkeypatch.setenv("AZURE_DDNS_HOSTS", "new.example.com")
     p.settings_changed()
-    p.ddns_update(force=False)
+    out = p.ddns_update(force=False)
+    assert [h["host"] for h in out] == ["new.example.com"] and keeper.known() == ["new.example.com"]
     assert not keeper.taken("home.example.com") and keeper.own("home.example.com") is None
-    assert keeper.own("new.example.com") == HOME
+    assert json.loads(ddns_state_file().read_text(encoding="utf-8")) == {"own": {"new.example.com": HOME}, "taken": []}
+    network[0] = OTHER
+    monkeypatch.setenv("AZURE_DDNS_HOSTS", "new.example.com, home.example.com")  # put back
+    p.settings_changed()
+    out = {h["host"]: h for h in p.ddns_update(force=True)}
+    assert out["new.example.com"]["result"] == f"set (was {HOME})" and a_record(fake, "new") == [OTHER]  # its own: kept
+    assert out["home.example.com"]["foreign"] is True and a_record(fake, "home") == [HOME]  # no longer its own: as it is
+    assert out["home.example.com"]["result"] == f"holds {HOME}, not this network's address: left as it is (Take over… to point it here)"
+    rows = next(t for t in p.status()["tables"] if t["title"] == "Dynamic DNS")["rows"]
+    take = {r[0]: r[-1] for r in rows}["home.example.com"]
+    assert take["form"] == "ddns-take" and take["values"] == {"host": "home.example.com", "holds": HOME}
+    assert keeper.known() == ["new.example.com"]
 
 
-@pytest.mark.skipif(not hasattr(__import__("liminal_libs.machines.ddns", fromlist=["Keeper"]).Keeper, "known"),
-                    reason="the keeper lists what it holds from liminal-libs 1.49.4")
+def test_the_hosts_are_settled_only_once_the_zones_are_read(made, env, monkeypatch):
+    """Never on zones not read: a refresh whose zone list failed lets no host go (nor does a pass, which has no host in
+    the zones then); the next refresh that reads them does."""
+    env(settings_of(AZURE_DDNS_HOSTS="new.example.com"))
+    p, fake = made()
+    p.ddns_update(force=False)
+    assert p.keeper().own("new.example.com") == HOME
+    monkeypatch.setenv("AZURE_DDNS_HOSTS", "home.example.com")  # new.example.com taken out of the setting
+    p.settings_changed()
+    fake.fail["zones"] = (500, "InternalServerError", "The server encountered an internal error.")
+    p.refresh()
+    assert p.snapshot().troubles.get("zones") and p.snapshot().zones == []
+    assert p.keeper().own("new.example.com") == HOME  # nothing let go on zones not read
+    with pytest.raises(ValueError, match="no Dynamic DNS host is in the subscription's Azure DNS zones"):
+        p.ddns_update(force=False)
+    assert p.keeper().known() == ["new.example.com"]
+    fake.fail.clear()
+    p.refresh()
+    assert p.keeper().known() == [] and a_record(fake, "new") == [HOME]  # let go; its record left as it is
+    assert puts(fake)[-1]["path"].endswith("/A/new") and len(puts(fake)) == 1
+
+
 def test_a_host_taken_out_of_the_settings_while_it_was_not_running_is_let_go(made, env):
-    """What the keeper held as its own before a restart, for a host no longer set, is let go at the first pass."""
+    """What the keeper held before a restart, for a host no longer set, is let go once the zones are read (the first
+    refresh, before the first pass)."""
     ddns_state_file().parent.mkdir(parents=True, exist_ok=True)
     ddns_state_file().write_text(json.dumps({"own": {"gone.example.com": "198.51.100.9"}, "taken": ["old.example.com"]}),
                                  encoding="utf-8")

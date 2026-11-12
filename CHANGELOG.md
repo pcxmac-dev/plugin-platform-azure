@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.1.2 (2026-11-11)
+
+What the re-verification of the audit's fixes found in Dynamic DNS (liminal-libs 1.49.7), fixed:
+
+- **Take over… is asked twice.** It sets the record at once and drops every address it holds, so the keeper refuses
+  until `accept_take_over` is exactly true (`ddns.TakeOverRefused`), which the page asks as a second confirmation (the
+  take form's third field). Before it, the host must be in the setting and its record still hold what the page showed
+  (read again); else nothing is taken over.
+- **A host taken out of the setting is let go, while the plugin ran or not** (`Keeper.settle`): with the whole
+  `AZURE_DDNS_HOSTS` setting, after each refresh and before each pass, and only once the subscription's zones are read
+  (never on a zone list not read). Put back in the setting later, it is left as it is, its row offering Take over…
+  again. It replaces the plugin's own letting go.
+- Needs liminal-libs 1.49.7.
+
 ## 0.1.1 (2026-11-11)
 
 What the audit of the six cloud plugins found before any key went in (session 87405e6a: eight reviewers, a skeptic per

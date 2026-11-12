@@ -44,7 +44,7 @@ Only what costs nothing, each through a form on the platform's page that names t
 | **Add a security rule** | once; **twice** when risky | none |
 | **Remove a security rule** | once; **twice** when risky | none |
 | **Add / remove an SSH public key** | once | none (a key resource is free) |
-| **Take over** a Dynamic DNS host | once | none: its A record pointed at this network from then on |
+| **Take over** a Dynamic DNS host | **twice** | none: its A record pointed at this network at once (what it held dropped) |
 | **Update DNS now** | once | none |
 
 A risky rule is one that opens every port, or a service no one should reach from everywhere (SSH, RDP, Telnet, SMB,
@@ -170,15 +170,17 @@ Each host in `AZURE_DDNS_HOSTS` that is in one of the subscription's Azure DNS z
 IPv4 address (the library's `machines.ddns.Keeper`), but only when its record is Dynamic DNS's own: a host with no A
 record (made, with a TTL of 300 seconds), one already pointing here or at the address it set last, or one you took over.
 Any other record (another address, or several) is left as it is, its row saying what it holds and offering **Take
-over…**: once confirmed (its words name what the record holds and that it will point here), the host's A record is set
-to this network's address alone and kept there. Several addresses are never cut to one unasked. What is its own is kept
+over…**: asked twice (its words name what the record holds and that it will point here; then that every address it
+holds is dropped at once, `accept_take_over`), and only while the record still holds what the page showed, the host's
+A record is set to this network's address alone and kept there. Several addresses are never cut to one unasked. What is its own is kept
 in the platform's folder (`LIMINAL_PLATFORM_DIR`, else the data folder's `platform/`), under `azure/ddns.json`.
 
 This network's address is asked of OpenDNS's resolver (`myip.opendns.com`), else Google's (`o-o.myaddr.l.google.com`),
 each by its own address, and asked again just before a write (nothing is written if it changed meanwhile). Each host's
 A record set is written with its etag, its TTL and metadata kept. **Update DNS now** (confirmed) writes every host of its
-own. A host taken out of the settings is let go; a host whose A record you set by hand on the page is let go too (left as
-you set it, until you take it over again). An alias record set, a name that is a CNAME, or a zone name two resource
+own. A host taken out of the setting is let go (`Keeper.settle`, with the whole setting once the zones are read: while
+the plugin ran or not), and put back later it is left as it is until taken over again; a host whose A record you set by
+hand on the page is let go too (left as you set it, until you take it over again). An alias record set, a name that is a CNAME, or a zone name two resource
 groups hold, is not written: its row says why. A host in no zone of the subscription is said in the plugin's problem,
 and with no host in any zone, not even this network's address is asked.
 
@@ -206,7 +208,8 @@ accept_costs=False)` (action: start, restart, deallocate, poweroff), `set_record
 `remove_record(group, zone, name, rtype, value="")`, `add_rule(group, nsg, name, direction, access, protocol, ports,
 source=None, destination=None, priority=None, description=None, accept_risky=False)`, `remove_rule(group, nsg, name,
 accept_risky=False)`, `add_ssh_key(group, name, public_key, location=None)`, `remove_ssh_key(group, name)`,
-`ddns_update(force=True)`, `ddns_take_over(host, holds=None)`. A change's answer: `said`, `lines`, `ok`.
+`ddns_update(force=True)`, `ddns_take_over(host, holds=None, accept_take_over=False)`. A change's answer: `said`, `lines`,
+`ok`.
 
 ## From the command line
 

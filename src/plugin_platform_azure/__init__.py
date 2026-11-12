@@ -45,7 +45,7 @@ from .page import ACCEPT_BILLED, ACCEPT_COSTS, ACCEPT_RISKY, BILLING, plural, wh
 from .records import Refusal
 from .settings import CREDENTIALS, KEYS, NAMES, Config
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 REFRESH_S = 900.0  # the subscription read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -128,7 +128,6 @@ class _Runtime:
         self.keeper: dyndns.Keeper | None = None
         self.ddns_print = ""
         self.ddns_at: float | None = None
-        self.ddns_had: set[str] = set()  # the Dynamic DNS hosts of the last pass: one no longer set is let go
         self.passing = threading.local()  # the Dynamic DNS pass under way in this thread (_Pass)
         self.soon: float | None = None  # when the VMs' states are read again after a power change (monotonic)
         self.worker: threading.Thread | None = None
@@ -295,6 +294,7 @@ class AzurePlugin(MachinePlugin):
             self._rt.snap, self._rt.snap_print = snap, cfg.api_print
             self._rt.api_ok, self._rt.api_error, self._rt.api_error_at, self._rt.api_print = True, "", None, cfg.api_print
             self._rt.api_transient = False
+        self._settle(cfg, snap)  # the whole setting is known here, and the zones read
         return {"vms": len(vms), "zones": len(snap.zones), "nsgs": len(snap.nsgs), "readAt": when(now),
                 "troubles": dict(troubles)}
 
@@ -737,21 +737,23 @@ class AzurePlugin(MachinePlugin):
         secrets = [*cfg.secrets, *(s.lower() for s in cfg.secrets)]
         return hosts, [scrub(w, secrets) for w in wrong]
 
+    def _settle(self, cfg: Config, snap: model.Snapshot | None) -> list[str]:
+        """The keeper's hosts no longer in the Dynamic DNS setting let go (Keeper.settle: taken out while the plugin ran or
+        not, a host put back is left as it is until taken over again). Only with the whole setting, and only once the
+        subscription's zones are read: never on a zone list not read (which would let every host go)."""
+        if snap is None or snap.troubles.get("zones"):
+            return []
+        return self.keeper().settle([_fqdn(text) for text in cfg.hosts])
+
     def _ddns_pass(self, cfg: Config, hosts: list, force: bool = False, stop: threading.Event | None = None,
                    wait: float = 120.0) -> list[dict]:
         """A Dynamic DNS pass over `hosts` with these settings (none read again during it), the zones as last read, and
-        `stop` (the plugin detached ends it before its next write). The hosts taken out of the settings are let go."""
+        `stop` (the plugin detached ends it before its next write). The hosts taken out of the setting are let go first."""
         snap = self._snap_of(cfg)
         if snap is None:
             raise ValueError("the subscription's zones are not read yet")
         keeper = self.keeper()
-        named = {_fqdn(text) for text in cfg.hosts}  # as set, whatever zones were read (a zone not read lets none go)
-        known = getattr(keeper, "known", None)  # liminal-libs 1.49.4: every host it holds, from before a restart too
-        with self._rt.lock:
-            held = set(known()) if callable(known) else set(self._rt.ddns_had)
-            gone, self._rt.ddns_had = held - named, {h.fqdn for h in hosts} | (self._rt.ddns_had & named)
-        for fqdn in sorted(gone):
-            keeper.let_go(fqdn)
+        self._settle(cfg, snap)
         self._rt.passing.current = _Pass(cfg, self._client_for(cfg), snap, stop)
         try:
             out = keeper.run_pass(hosts, force=bool(force), wait=wait, stop=stop)
@@ -781,21 +783,31 @@ class AzurePlugin(MachinePlugin):
         hosts = self._ddns_ready(cfg)
         return self._ddns_pass(cfg, hosts, force=bool(force), stop=self._rt.stop)
 
-    def ddns_take_over(self, host: str, holds=None) -> dict:
-        """A host the keeper left as it is (it holds another address, or several) taken over (the page's Take over…, once
-        confirmed: its words name what it holds), then a pass for that host: its A record set to this network's address
-        alone, and kept there."""
+    def ddns_take_over(self, host: str, holds=None, accept_take_over=False) -> dict:
+        """A host the keeper left as it is (it holds another address, or several) taken over, asked twice (the page's
+        Take over…: its confirmation names what it holds, then the keeper refuses until `accept_take_over` is exactly
+        true, as it drops every address it holds at once). The host must be in the setting and its record still hold what
+        the page showed (read now); then a pass for that host sets its A record to this network's address alone, and keeps
+        it there."""
         cfg = self.config(fresh=True)
         hosts = self._ddns_ready(cfg)
         want = str(host or "").strip().rstrip(".").lower()
         h = next((x for x in hosts if x.fqdn == want), None)
         if h is None:
             raise ValueError(f"{host} is none of the Dynamic DNS hosts in the subscription's zones ({settings_mod.DDNS_HOSTS})")
+        snap = self._snap_of(cfg)
+        z = self._ddns_zone(snap, h)
+        held = self._client_for(cfg).record_set(z["group"], z["name"], "A", h.name)  # what it holds now
+        now = held.values if held is not None else []
+        shown = [a.strip() for a in str(holds or "").replace(";", ",").split(",") if a.strip()]
+        if holds is not None and sorted(shown) != sorted(now):
+            raise Refusal(f"{h.fqdn} holds {', '.join(now) or 'nothing'} now, not {', '.join(shown) or 'nothing'} as shown: "
+                          "nothing taken over (look at it again, then take it over)")
         keeper = self.keeper()
-        keeper.take_over(h.fqdn)
+        keeper.take_over(h.fqdn, accept=accept_take_over, holds=", ".join(now) or "nothing")  # TakeOverRefused unless exactly true
         out = self._ddns_pass(cfg, [h], force=False, stop=self._rt.stop)
         st = out[0] if out else {}
-        lines = [f"it held {holds}" if holds else "", "kept at this network's address from now on"]
+        lines = [f"it held {', '.join(now)}" if now else "", "kept at this network's address from now on"]
         return {"host": h.fqdn, "ok": bool(st.get("ok")), "said": f"{h.fqdn} taken over: {st.get('result') or 'set on the next pass'}",
                 "lines": [x for x in lines if x], "state": st}
 
