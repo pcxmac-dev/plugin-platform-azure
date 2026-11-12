@@ -18,6 +18,9 @@ What the re-verification of the audit's fixes found in Dynamic DNS (liminal-libs
   up to date first, so it offers what the record holds now.
 - Needs liminal-libs 1.49.8.
 
+Needs liminal-libs>=1.49.9: a take-over's consent is bound to the addresses it drops (a record changed after
+a failed write is asked about again); the state file keeps each take-over's addresses.
+
 ## 0.1.1 (2026-11-11)
 
 What the audit of the six cloud plugins found before any key went in (session 87405e6a: eight reviewers, a skeptic per

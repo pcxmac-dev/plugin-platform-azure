@@ -62,7 +62,7 @@ def test_a_host_holding_another_address_is_left_as_it_is_and_offered_take_over(m
     assert {"form": "ddns-now", "title": "Update DNS now"} in st["actions"]  # confirmed now, no longer a plain hook
     assert not any(a.get("hook") == "ddns_update" for a in st["actions"])
     state = json.loads(ddns_state_file().read_text(encoding="utf-8"))  # kept in the platform's folder
-    assert state == {"own": {"new.example.com": HOME}, "taken": []}
+    assert state == {"own": {"new.example.com": HOME}, "taken": {}}
     assert ddns_state_file().as_posix().endswith("platform/azure/ddns.json")
 
 
@@ -164,7 +164,7 @@ def test_only_the_serving_platform_settles_so_its_own_command_line_forgets_nothi
     env(settings_of(AZURE_DDNS_HOSTS="new.example.com"))
     p, fake = made()
     p.ddns_update(force=False)
-    kept = {"own": {"new.example.com": HOME}, "taken": []}
+    kept = {"own": {"new.example.com": HOME}, "taken": {}}
     assert json.loads(ddns_state_file().read_text(encoding="utf-8")) == kept
     monkeypatch.setenv("AZURE_DDNS_HOSTS", "")  # a shell without the setting
     p.settings_changed()
@@ -242,7 +242,7 @@ def test_a_host_taken_over_then_taken_out_of_the_setting_is_let_go_and_put_back_
         out = p.ddns_update(force=False)
         assert [h["host"] for h in out] == ["new.example.com"] and keeper.known() == ["new.example.com"]
         assert keeper.own("home.example.com") is None
-        assert json.loads(ddns_state_file().read_text(encoding="utf-8")) == {"own": {"new.example.com": HOME}, "taken": []}
+        assert json.loads(ddns_state_file().read_text(encoding="utf-8")) == {"own": {"new.example.com": HOME}, "taken": {}}
         network[0] = OTHER
         set_hosts(p, login, "new.example.com, home.example.com")  # put back
         out = {h["host"]: h for h in p.ddns_update(force=True)}
@@ -261,7 +261,7 @@ def test_the_hosts_are_settled_only_once_the_zones_are_read(made):
     """Never on zones not read: the serving platform's refresh whose zone list failed lets no host go (nor does a pass,
     which has no host in the zones then); the next refresh that reads them does."""
     ddns_state_file().parent.mkdir(parents=True, exist_ok=True)
-    ddns_state_file().write_text(json.dumps({"own": {"new.example.com": HOME}, "taken": []}), encoding="utf-8")
+    ddns_state_file().write_text(json.dumps({"own": {"new.example.com": HOME}, "taken": {}}), encoding="utf-8")
     p, fake = made()
     fake.fail["zones"] = (500, "InternalServerError", "The server encountered an internal error.")
     p.attach(Platform(), Pairs(settings_of(AZURE_DDNS_HOSTS="home.example.com")))  # new.example.com no longer set
@@ -277,14 +277,14 @@ def test_the_hosts_are_settled_only_once_the_zones_are_read(made):
         assert p.keeper().known() == []  # let go once the zones are read
     finally:
         p.detach()
-    assert puts(fake) == [] and json.loads(ddns_state_file().read_text(encoding="utf-8")) == {"own": {}, "taken": []}
+    assert puts(fake) == [] and json.loads(ddns_state_file().read_text(encoding="utf-8")) == {"own": {}, "taken": {}}
 
 
 def test_a_host_taken_out_of_the_settings_while_it_was_not_running_is_let_go(made):
     """What the keeper held before a restart, for a host no longer set, is let go by the serving platform's plugin once
     the zones are read (its first refresh in the background, before its first pass)."""
     ddns_state_file().parent.mkdir(parents=True, exist_ok=True)
-    ddns_state_file().write_text(json.dumps({"own": {"gone.example.com": "198.51.100.9"}, "taken": ["old.example.com"]}),
+    ddns_state_file().write_text(json.dumps({"own": {"gone.example.com": "198.51.100.9"}, "taken": {"old.example.com": ["198.51.100.10"]}}),
                                  encoding="utf-8")
     p, fake = made()
     assert p.keeper().own("gone.example.com") == "198.51.100.9" and p.keeper().taken("old.example.com")
@@ -293,7 +293,7 @@ def test_a_host_taken_out_of_the_settings_while_it_was_not_running_is_let_go(mad
         assert wait_until(lambda: p.keeper().known() == ["new.example.com"] and p.keeper().own("new.example.com") == HOME)
     finally:
         p.detach()
-    assert json.loads(ddns_state_file().read_text(encoding="utf-8")) == {"own": {"new.example.com": HOME}, "taken": []}
+    assert json.loads(ddns_state_file().read_text(encoding="utf-8")) == {"own": {"new.example.com": HOME}, "taken": {}}
 
 
 def test_a_pass_stopped_by_a_detach_writes_nothing_and_reads_no_settings(made, env):
