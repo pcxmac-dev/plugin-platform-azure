@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.3 (2026-11-14)
+
+Drawn under the platform's Cloud plugins section, in the list on the left (the user: "classify the cloud plugins under the 'cloud plugins' section which should be on the far left"): `SECTION = "cloud"`. That is liminal-libs
+1.51.0's machine-plugin attribute; liminal-platform 0.25.0 draws it, and an older platform keeps the plugin under Machine
+plugins. Nothing else changes.
+
 ## 0.1.2 (2026-11-11)
 
 What the re-verification of the audit's fixes found in Dynamic DNS (liminal-libs 1.49.7), fixed:

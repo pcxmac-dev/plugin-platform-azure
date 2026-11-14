@@ -45,7 +45,7 @@ from .page import ACCEPT_BILLED, ACCEPT_COSTS, ACCEPT_RISKY, BILLING, plural, wh
 from .records import Refusal
 from .settings import CREDENTIALS, KEYS, NAMES, Config
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 REFRESH_S = 900.0  # the subscription read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -155,6 +155,7 @@ class AzurePlugin(MachinePlugin):
     api = "2.2"
     order = 764
     ICON = "azure"  # Azure's mark (liminal-libs 1.49.0's icons.js)
+    SECTION = "cloud"  # drawn under the platform's Cloud plugins (liminal-libs 1.51.0, liminal-platform 0.25.0)
     HOOKS = (*MachinePlugin.HOOKS, "refresh", "vms", "zones", "records", "nsgs", "ssh_keys", "power", "set_record",
              "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key", "ddns_update", "ddns_take_over")
     keys = KEYS
