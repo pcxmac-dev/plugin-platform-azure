@@ -318,9 +318,32 @@ def test_a_risky_rule_is_sent_only_once_that_is_accepted(read):
     assert p.ask(rf["hook"], *page_args(rf, b["values"], accepted={ACCEPT_RISKY}))["ok"]
     assert not any(r["name"] == "allow-ssh-home" for r in fake.nsgs["web1-nsg"]["rules"])
     # a rule that is no risk is asked once; a default rule cannot be removed
-    assert p.ask(rf["hook"], "web-rg", "web1-nsg", "allow-https", False)["ok"]
+    https = row_button(p, "web1-nsg rules", "Remove allow-https")["values"]["rule"]
+    assert p.ask(rf["hook"], "web-rg", "web1-nsg", "allow-https", https, False)["ok"]
     with pytest.raises(Refusal, match="default rules"):
-        p.ask(rf["hook"], "web-rg", "web1-nsg", "DenyAllInBound", True)
+        p.ask(rf["hook"], "web-rg", "web1-nsg", "DenyAllInBound", "DenyAllInBound: Deny inbound", True)
+
+
+def test_a_rule_is_removed_only_while_it_is_the_one_shown(read):
+    """The review of 2026-11-21, item 26: a rule was removed by its name alone, whatever it had become since it was
+    shown. The removal carries it in words, as Linode's and Vultr's do, and is refused, nothing sent, when it differs."""
+    p, fake = read
+    forms = forms_of(p)
+    b = row_button(p, "web1-nsg rules", "Remove allow-https")
+    rf = forms[b["form"]]
+    assert b["values"]["rule"] == "allow-https: Allow inbound Tcp to ports 443 from Internet to any, priority 310"
+    with pytest.raises(ValueError, match="name the rule as it was shown"):
+        p.ask(rf["hook"], "web-rg", "web1-nsg", "allow-https", None, False)
+    (https,) = [r for r in fake.nsgs["web1-nsg"]["rules"] if r["name"] == "allow-https"]
+    https["properties"]["destinationPortRange"] = "443-444"  # changed since it was shown
+    writes = len(fake.writes())
+    with pytest.raises(Refusal, match=r"allow-https: Allow inbound Tcp to ports 443-444 .* is the rule now, not "
+                                      r"allow-https: .* ports 443 .* as shown: nothing removed"):
+        p.ask(rf["hook"], *page_args(rf, b["values"]))
+    assert len(fake.writes()) == writes and https in fake.nsgs["web1-nsg"]["rules"]
+    again = row_button(p, "web1-nsg rules", "Remove allow-https")  # as read now: removed
+    assert p.ask(rf["hook"], *page_args(rf, again["values"]))["ok"]
+    assert https not in fake.nsgs["web1-nsg"]["rules"]
 
 
 def test_an_ssh_key_is_added_and_removed(read):

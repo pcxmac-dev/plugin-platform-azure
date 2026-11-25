@@ -60,7 +60,8 @@ def test_a_full_refresh_makes_only_the_calls_the_card_names(made, env):
     p.set_record("dns-rg", "example.com", "blog", "A", "203.0.113.5")
     p.remove_record("dns-rg", "example.com", "blog", "A", "203.0.113.5")
     p.add_rule("web-rg", "web1-nsg", "allow-dns", "Inbound", "Allow", "Udp", "53", "10.0.0.0/8", "*", 400)
-    p.remove_rule("web-rg", "web1-nsg", "allow-dns")
+    p.remove_rule("web-rg", "web1-nsg", "allow-dns",
+                  "allow-dns: Allow inbound Udp to ports 53 from 10.0.0.0/8 to any, priority 400")
     p.add_ssh_key("web-rg", "desk", ssh_key("ssh-rsa", 3072))
     p.remove_ssh_key("web-rg", "desk")
 

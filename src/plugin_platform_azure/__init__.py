@@ -45,7 +45,7 @@ from .page import ACCEPT_BILLED, ACCEPT_COSTS, ACCEPT_RISKY, BILLING, plural, wh
 from .records import Refusal
 from .settings import CREDENTIALS, KEYS, NAMES, Config
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 REFRESH_S = 900.0  # the subscription read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -600,19 +600,29 @@ class AzurePlugin(MachinePlugin):
         return {"nsg": g["name"], "group": g["group"], "rule": made.as_dict(), "ok": True, "said": f"added {nsg_rules.said(made)}",
                 "lines": [*([f"{risk} (accepted)"] if risk else []), f"{g['name']}'s other rules were left as they were"]}
 
-    def remove_rule(self, group: str, nsg: str, name: str, accept_risky=False) -> dict:
-        """A security rule removed, the group read just before (its default rules cannot be); the rule letting SSH or RDP
-        in to a VM the group is attached to, or a Deny keeping a later rule from opening a risky service to the whole
-        internet, only once that is accepted (accept_risky, exactly true)."""
+    def remove_rule(self, group: str, nsg: str, name: str, rule=None, accept_risky=False) -> dict:
+        """A security rule removed, the group read just before (its default rules cannot be), once it is checked to be
+        the one shown (`rule`: it in words as the page showed it, rules.said, needed); the rule letting SSH or RDP in to a
+        VM the group is attached to, or a Deny keeping a later rule from opening a risky service to the whole internet,
+        only once that is accepted (accept_risky, exactly true)."""
+        if rule in (None, ""):
+            # by its name alone, a rule changed since it was shown (another port, other sources) went unseen (the
+            # review of 2026-11-21, item 26): Linode's and Vultr's removals carry the rule as shown, so does this one
+            raise ValueError(f"name the rule as it was shown ({name} in words), so a rule changed since is not removed "
+                             "unseen")
         g = self._nsg(group, nsg)
         api = self.client()
         rules_now, defaults_now, servers = self._nsg_now(api, g)
         wanted = str(name or "").strip().lower()
-        rule = next((r for r in rules_now if r.name.lower() == wanted), None)
-        if rule is None:
+        found = next((r for r in rules_now if r.name.lower() == wanted), None)
+        if found is None:
             if any(r.name.lower() == wanted for r in defaults_now or g["defaults"]):
                 raise Refusal(f"{name} is one of {g['name']}'s default rules: those cannot be removed")
             raise Refusal(f"{g['name']} has no rule named {name} (read just now)")
+        if nsg_rules.said(found) != str(rule).strip():
+            raise Refusal(f"{nsg_rules.said(found)} is the rule now, not {str(rule).strip()} as shown: nothing removed (the "
+                          "page shows it as read now)")
+        rule = found
         risk = nsg_rules.risk_of_removing(rule, servers, others=rules_now)
         if risk and not accepted(accept_risky):
             raise Refusal(f"{nsg_rules.said(rule)}: {risk}. It is removed only once that is accepted ({ACCEPT_RISKY})",

@@ -145,7 +145,8 @@ def nsg_tables(snap: Snapshot, writable: bool) -> list:
             if writable:
                 row.append("" if r.default else {"form": f"rule-remove:{g['group']}/{g['name']}", "title": "Remove",
                                                   "label": f"Remove {r.name} from {g['name']}",
-                                                  "values": {"group": g["group"], "nsg": g["name"], "name": r.name}})
+                                                  "values": {"group": g["group"], "nsg": g["name"], "name": r.name,
+                                                             "rule": nsg_rules.said(r)}})
             rows.append(row)
         table = {"title": f"{g['name']} rules", "note": (
             f"{g['group']} · attached to {', '.join(g['servers']) or 'no VM'} · the lower the priority, the sooner a rule "
@@ -349,9 +350,11 @@ def rule_forms(g: dict) -> list:
                                "priority {priority}, is added to {nsg}. Its other rules are kept."),
                      "yes": "Add the rule"}},
         {"id": f"rule-remove:{rg}/{nsg}", "hook": "remove_rule", "title": f"Remove a rule from {nsg}",
-         "fields": [*fixed, {"name": "name", "label": "Rule", "type": "fixed"}, accept],
+         "fields": [*fixed, {"name": "name", "label": "Rule", "type": "fixed"},
+                    {"name": "rule", "label": "As shown", "type": "fixed"}, accept],
          "confirm": {"title": f"Remove this rule from {nsg}?",
-                     "words": "{name} is removed from {nsg} (attached to " + servers + "). Its other rules are kept.",
+                     "words": ("{rule} is removed from {nsg} (attached to " + servers + "), unless it is another rule by "
+                               "now. Its other rules are kept."),
                      "yes": "Remove the rule", "danger": True}},
     ]
 
