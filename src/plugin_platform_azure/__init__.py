@@ -19,6 +19,13 @@ of it runs, and a pass under way writes nothing more. A read that failed for a p
 leaves it valid, says so, and is tried again within minutes. Its status is what was read last (no request is made to
 answer it).
 
+Who may ask its changes (0.1.5; the independent review's PLT-H1 and the sweep of the plugins after it, 2026-11-25): a VM's
+power, a record set or removed, a security rule added or removed, an SSH key stored or removed, a Dynamic DNS pass and a
+host taken over are asked only from its page (PAGE_ONLY_HOOKS): another plugin's ask is refused, and the platform asks its
+login whether you are at the page. Before, any program on this PC could ask them of the platform with a header anyone can
+send, and the service principal's secret did the rest; a second confirmation is an argument the asker sets. Its reads are
+asked by anyone. The background and the command line call the same code themselves: those are not asks.
+
     python -m plugin_platform_azure status | servers | groups | disks | ips | firewalls | domains | records ZONE | keys
         | cost | ddns [--now] | power NAME start|restart|deallocate|poweroff | set ZONE NAME TYPE VALUE | remove ZONE NAME TYPE VALUE
 """
@@ -45,7 +52,7 @@ from .page import ACCEPT_BILLED, ACCEPT_COSTS, ACCEPT_RISKY, BILLING, plural, wh
 from .records import Refusal
 from .settings import CREDENTIALS, KEYS, NAMES, Config
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 REFRESH_S = 900.0  # the subscription read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -158,6 +165,15 @@ class AzurePlugin(MachinePlugin):
     SECTION = "cloud"  # drawn under the platform's Cloud plugins (liminal-libs 1.51.0, liminal-platform 0.25.0)
     HOOKS = (*MachinePlugin.HOOKS, "refresh", "vms", "zones", "records", "nsgs", "ssh_keys", "power", "set_record",
              "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key", "ddns_update", "ddns_take_over")
+    # Its changes, asked only from its page (0.1.5, the sweep after the review's PLT-H1; liminal-libs 1.66.0's
+    # apps/asking.py): another plugin's ask is refused (403), and liminal-platform 0.34.0 refuses one over HTTP (401) unless
+    # its login shows that you are at the page. Before, any program on this PC could ask them of the platform with a header
+    # anyone can send, the page's dialogs being the only confirmation (a second one, accept_costs or accept_risky, is an
+    # argument the asker sets): a deallocated VM started and billing again, a record replaced, SSH opened to the whole
+    # internet, as your service principal. The background's reads and Dynamic DNS passes and the command line call the code
+    # directly, not through an ask; its reads (refresh and the lists among them) are asked by anyone.
+    PAGE_ONLY_HOOKS = ("power", "set_record", "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key",
+                       "ddns_update", "ddns_take_over")
     keys = KEYS
     signup = "https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-service-principal-portal"
     limits = ("Azure Resource Manager: per region, 250 reads (refilled 25 a second), 200 writes and 200 deletes (10 a second) "

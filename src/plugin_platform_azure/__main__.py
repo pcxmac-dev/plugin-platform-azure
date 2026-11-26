@@ -17,7 +17,8 @@ EnvironmentLogin: the variables as this shell has them).
                                              a record set, every other record kept, once you type yes
     remove ZONE NAME TYPE VALUE [--group G]  a record removed, the rest kept, once you type yes
 
---json prints the answer as JSON."""
+--json prints the answer as JSON. The platform asks the plugin's changes only from its page (PAGE_ONLY_HOOKS, 0.1.5); this
+command line asks the platform nothing: it calls the same code in its own process, with this shell's settings, as before."""
 from __future__ import annotations
 
 import argparse
