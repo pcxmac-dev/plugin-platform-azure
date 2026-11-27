@@ -218,7 +218,7 @@ accept_risky=False)`, `add_ssh_key(group, name, public_key, location=None)`, `re
 `remove_record`, `add_rule`, `remove_rule`, `add_ssh_key`, `remove_ssh_key`, `ddns_update` and `ddns_take_over`.
 Another plugin's ask of one is refused, and over HTTP the platform refuses one unless its login shows that you are at
 the page (liminal-libs 1.66.0 and liminal-platform 0.34.0 read the word; what is older than those asks them as before).
-`present`, `status`, `refresh()` and the reads are asked by anyone. The plugin's own background (its reads, its Dynamic
+`present` and `status` are asked by anyone. From 0.1.6 `refresh()` and every other read is asked only from the page too (`refresh`, `vms`, `zones`, `records`, `nsgs`, `ssh_keys`): each is made with the subscription's key. The plugin's own background (its reads, its Dynamic
 DNS passes) and its command line call the code themselves: they are not asks. The platform's check rests on its
 login's word that your browser is signed in, and a local login signs `secret` and `default` in with no password: it
 does not stop a program on this PC that signs itself in.

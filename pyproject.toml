@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "plugin-platform-azure"
-version = "0.1.5"  # the plugin's own release (CHANGELOG.md); the platform shows it on the plugin's page
+version = "0.1.6"  # the plugin's own release (CHANGELOG.md); the platform shows it on the plugin's page
 description = "Microsoft Azure for Liminal's platform: a subscription's VMs with their power state and price, disks, public IPs, network security groups, Azure DNS and SSH keys through Azure Resource Manager; free changes only, each confirmed; Dynamic DNS through Azure DNS."
 readme = "README.md"
 requires-python = ">=3.10"

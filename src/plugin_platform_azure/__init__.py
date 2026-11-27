@@ -24,7 +24,7 @@ power, a record set or removed, a security rule added or removed, an SSH key sto
 host taken over are asked only from its page (PAGE_ONLY_HOOKS): another plugin's ask is refused, and the platform asks its
 login whether you are at the page. Before, any program on this PC could ask them of the platform with a header anyone can
 send, and the service principal's secret did the rest; a second confirmation is an argument the asker sets. Its reads are
-asked by anyone. The background and the command line call the same code themselves: those are not asks.
+asked only from its page too since 0.1.6 (`present` and `status` by anyone). The background and the command line call the same code themselves: those are not asks.
 
     python -m plugin_platform_azure status | servers | groups | disks | ips | firewalls | domains | records ZONE | keys
         | cost | ddns [--now] | power NAME start|restart|deallocate|poweroff | set ZONE NAME TYPE VALUE | remove ZONE NAME TYPE VALUE
@@ -52,7 +52,7 @@ from .page import ACCEPT_BILLED, ACCEPT_COSTS, ACCEPT_RISKY, BILLING, plural, wh
 from .records import Refusal
 from .settings import CREDENTIALS, KEYS, NAMES, Config
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 REFRESH_S = 900.0  # the subscription read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -171,9 +171,15 @@ class AzurePlugin(MachinePlugin):
     # anyone can send, the page's dialogs being the only confirmation (a second one, accept_costs or accept_risky, is an
     # argument the asker sets): a deallocated VM started and billing again, a record replaced, SSH opened to the whole
     # internet, as your service principal. The background's reads and Dynamic DNS passes and the command line call the code
-    # directly, not through an ask; its reads (refresh and the lists among them) are asked by anyone.
+    # directly, not through an ask; its reads (refresh and the lists among them) are asked only from its page too since 0.1.6 (`present` and `status` by anyone).
     PAGE_ONLY_HOOKS = ("power", "set_record", "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key",
                        "ddns_update", "ddns_take_over")
+    # Its reads made with the subscription's key, asked only from its page too (0.1.6; liminal-libs 1.107.0 closes
+    # every hook a plugin declares for no one, and the user, 2026-11-26, chose "Page-only" for these): each sends
+    # requests as you and returns what the account holds, so another plugin's ask and an ask that names no one are
+    # refused, and the platform asks its login whether you are at the page. `present` and `status` stay anyone's
+    # (MachinePlugin's reads).
+    PAGE_ONLY_HOOKS = (*PAGE_ONLY_HOOKS, "refresh", "vms", "zones", "records", "nsgs", "ssh_keys")
     keys = KEYS
     signup = "https://learn.microsoft.com/en-us/entra/identity-platform/howto-create-service-principal-portal"
     limits = ("Azure Resource Manager: per region, 250 reads (refilled 25 a second), 200 writes and 200 deletes (10 a second) "

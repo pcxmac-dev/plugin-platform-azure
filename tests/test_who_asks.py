@@ -6,7 +6,8 @@ no one; over HTTP the platform also asks its login whether you are at the page. 
 of the platform with a header anyone can send, and the service principal's secret did the rest: a deallocated VM started
 (its compute charge began again), SSH opened to the whole internet and the rule letting SSH in from home removed (each
 second confirmation being only an argument), the domain's address set to another with no second question at all. Its
-reads are asked by anyone, as before. Asked through the library's own App (its ask names who asks as the platform's
+reads are asked only from its page too since 0.1.6 (closed by default: the account's key makes them; `present` and
+`status` alone are anyone's). Asked through the library's own App (its ask names who asks as the platform's
 does), over the stand-in Azure: nothing reaches Azure or the network."""
 from __future__ import annotations
 
@@ -24,6 +25,11 @@ from plugin_platform_azure import rules as nsg_rules  # noqa: E402
 CHANGES = ("power", "set_record", "remove_record", "add_rule", "remove_rule", "add_ssh_key", "remove_ssh_key",
            "ddns_update", "ddns_take_over")
 READS = ("present", "status", "refresh", "vms", "zones", "records", "nsgs", "ssh_keys")
+# 0.1.6, closed by default (the user, 2026-11-26: "Page-only"): the reads made with the account's key are its
+# page's alone too; the contract's own two stay anyone's
+OPEN_READS = ("present", "status")
+PAGE_READS = tuple(h for h in READS if h not in OPEN_READS)
+READ_ARGS = {'records': ('example.com',)}  # the argument a read takes, as another program words it
 HOSTS = "new.example.com,home.example.com"  # Dynamic DNS's: one with no record yet, one holding another address
 SSH_HOME = nsg_rules.said(nsg_rules.parse(rule("allow-ssh-home", 300, "22", "203.0.113.0/24")))  # the rule as any read shows
 ASKED = {  # each change as another program worded it: the hook's arguments, a second confirmation said where it has one
@@ -92,17 +98,17 @@ def attached(made):
     app.detach(plugin.name)
 
 
-def test_its_changes_are_said_to_be_asked_only_from_its_page_and_its_reads_by_anyone():
-    assert set(internal.page_only(MACHINE)) == set(CHANGES)  # what the platform reads
+def test_its_changes_are_said_to_be_asked_only_from_its_page_and_its_reads_with_the_key_too():
+    assert set(internal.page_only(MACHINE)) == {*CHANGES, *PAGE_READS}  # what the platform reads
     assert internal.plugin_only(MACHINE) == ()
     assert internal.problems(MACHINE) == []  # each a hook of its own, and someone may ask it
     assert set(CHANGES) | set(READS) == set(MACHINE.interface()["hooks"]) and set(ASKED) == set(CHANGES)
-    for hook in CHANGES:
+    for hook in (*CHANGES, *PAGE_READS):
         assert asking.refusal(MACHINE, hook, asking.PAGE) == ""
         assert asking.refusal(MACHINE, hook, "neighbour") == (f"azure's {hook} is asked only from its page, "
                                                               "never by another plugin: neighbour asked it.")
         assert asking.refusal(MACHINE, hook, None).endswith("This ask names no asker: neither the page nor a plugin.")
-    for hook in READS:
+    for hook in OPEN_READS:
         assert {asking.refusal(MACHINE, hook, who) for who in (asking.PAGE, "neighbour", None)} == {""}
 
 
@@ -112,10 +118,14 @@ def test_another_plugin_or_no_one_asking_a_change_sends_nothing_and_its_page_doe
         for ask in (neighbour.wants, app.on_its_own):
             with pytest.raises(asking.AskRefused, match=f"azure's {hook} is asked only from its page"):
                 ask(hook, *ASKED[hook])
+    for hook in PAGE_READS:  # 0.1.6: a read made with the key is refused them too, and nothing is sent for it
+        for ask in (neighbour.wants, app.on_its_own):
+            with pytest.raises(asking.AskRefused, match=f"azure's {hook} is asked only from its page"):
+                ask(hook, *READ_ARGS.get(hook, ()))
     assert fake.requests == []  # nothing sent, nor read: not a token asked for, not the read a change makes first
-    assert neighbour.wants("present") is True and neighbour.wants("status")["valid"] is True  # its reads, as before
-    assert app.on_its_own("refresh") is not None and [v["name"] for v in neighbour.wants("vms")] == ["web1", "win1"]
-    assert len(neighbour.wants("records", "example.com")) == 8
+    assert neighbour.wants("present") is True and neighbour.wants("status")["valid"] is True  # the contract's reads, anyone's as before
+    assert app.from_page("refresh") is not None and [v["name"] for v in app.from_page("vms")] == ["web1", "win1"]
+    assert len(app.from_page("records", "example.com")) == 8
     assert fake.writes() == []
     for hook in CHANGES:  # the same asks from its page: each one sent
         sent = len(fake.writes())
@@ -134,3 +144,18 @@ def test_its_own_code_asks_nothing_of_the_app_and_runs_as_before(attached):
     new, home = plugin.ddns_update(force=False)
     assert new["ok"] is True and home["foreign"] is True
     assert fake.writes() == [("PUT", f"{ZONE}/A/new")]
+
+
+def test_no_hook_is_left_undeclared():
+    """0.1.6, closed by default (liminal-libs 1.107.0): every hook it answers says who may ask it, so none is left to
+    the default and the library's conformance has no warning. Read from its words, so it holds on an older library."""
+    from liminal_libs.sources import conformance
+
+    said = {h for word in ("READ_HOOKS", "SERVICE_HOOKS", "PLUGIN_ONLY_HOOKS", "PAGE_ONLY_HOOKS")
+            for h in internal.declared(MACHINE, word)}
+    own = [h for h in MACHINE.interface()["hooks"] if h not in ("setup", "run", "scan")]
+    assert own and [h for h in own if h not in said] == []
+    assert set(PAGE_READS) <= set(internal.declared(MACHINE, "PAGE_ONLY_HOOKS"))
+    assert not set(PAGE_READS) & set(internal.declared(MACHINE, "READ_HOOKS"))  # none is opened again as a read
+    warnings = getattr(conformance, "warnings", None)  # liminal-libs 1.107.0
+    assert warnings is None or warnings(MACHINE) == []
